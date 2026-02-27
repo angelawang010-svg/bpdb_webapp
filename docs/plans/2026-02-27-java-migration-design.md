@@ -1,6 +1,6 @@
 # BlogPlatformDB — Java Migration Design
 
-**Version:** 2.0
+**Version:** 3.0
 **Last Updated:** 2026-02-27
 **Status:** Draft — Awaiting Final Approval
 
@@ -8,16 +8,17 @@
 
 ## Change Log
 
-| Version | Date       | Changes |
-|---------|------------|---------|
-| 1.0     | 2026-02-27 | Initial design: back-end only (Spring Boot, PostgreSQL, REST API, 6 sections) |
-| 2.0     | 2026-02-27 | Major revision: added React + TypeScript front-end, expanded all sections with detailed implementation notes, added overall architecture diagram, monorepo structure, front-end structure, AWS cloud migration plan, implementation phases, response format examples, authentication flow diagrams, testing pyramid with front-end tests, CSRF/CORS details, deferred features list, changelog and versioning |
+| Version | Date       | Author | Summary | Details |
+|---------|------------|--------|---------|---------|
+| 1.0 | 2026-02-27 | Angela + Claude | Initial design | Back-end only design with Spring Boot, PostgreSQL, REST API. Covered 6 sections: project structure, entity model, API endpoints, business logic migration, security & auth, testing strategy. |
+| 2.0 | 2026-02-27 | Angela + Claude | Major expansion + front-end | Added React + TypeScript front-end (Vite, Tailwind, React Query). Expanded all 6 original sections with detailed field-level entity descriptions, DTO listings, response format examples. Added: overall architecture diagram with request flow, monorepo structure, front-end file structure with components/pages/hooks, authentication flow diagram, Spring Security filter chain, CSRF/CORS details, testing pyramid with front-end tests (Vitest, React Testing Library, MSW, Cypress), 5 implementation phases, AWS cloud migration plan with architecture diagram and cost estimates, deferred features list. Added changelog and versioning. |
+| 3.0 | 2026-02-27 | Angela + Claude | Deployment strategy change | Replaced AWS as primary deployment target with VPS (self-hosted). Rationale: AWS is overkill for a few thousand users (~$50-80/month vs ~$6-12/month for a VPS). Added detailed VPS deployment section covering Docker, Nginx, SSL, backups, monitoring, and firewall. Demoted AWS to a future growth option (Phase 5 → optional). Updated implementation phases to reflect VPS as Phase 4 deployment target. Added Nginx architecture diagram and deployment commands. |
 
 ---
 
 ## Overview
 
-Migrate the BlogPlatformDB SQL Server database project into a full-stack modern web application. The back-end is a Spring Boot REST API with PostgreSQL. The front-end is a React single-page application with TypeScript. The application initially runs on a self-hosted server for a few thousand users, with a defined path to AWS cloud migration.
+Migrate the BlogPlatformDB SQL Server database project into a full-stack modern web application. The back-end is a Spring Boot REST API with PostgreSQL. The front-end is a React single-page application with TypeScript. The application runs on a self-hosted VPS (Virtual Private Server) for a few thousand users, with Docker and Nginx handling containerization and traffic routing. AWS cloud migration is documented as a future growth option if the application outgrows a single server.
 
 ## Tech Stack
 
@@ -876,44 +877,219 @@ Build the React application.
 
 **Deliverable:** Full working web application (React + Spring Boot + PostgreSQL).
 
-### Phase 4: Production Hardening
+### Phase 4: Production Deployment (VPS)
 
-Prepare for real users on a self-hosted server.
+Deploy to a VPS and prepare for real users. See Section 10 for full deployment details.
 
 - Environment-specific configuration (dev, staging, production)
 - Production Dockerfiles for both back-end and front-end
 - Docker Compose for full-stack production deployment
 - Nginx reverse proxy configuration (serves React static files, proxies /api to Spring Boot)
 - HTTPS via Let's Encrypt / Certbot
+- UFW firewall configuration (allow only ports 80, 443, 22)
 - Logging configuration (structured JSON logs, log rotation)
 - Health check endpoint (`/actuator/health`)
-- Database backup script (pg_dump cron job)
+- Database backup script (pg_dump cron job, daily backups, 7-day retention)
 - Rate limiting on all auth endpoints
 - Input sanitization for XSS prevention
 - Performance: connection pooling (HikariCP, default in Spring Boot), query optimization
+- Basic monitoring with Docker health checks and log alerts
 
-**Deliverable:** Production-ready application running on your own server.
+**Deliverable:** Production-ready application running on a VPS, accessible via HTTPS.
 
-### Phase 5: AWS Cloud Migration
+### Phase 5 (Optional): AWS Cloud Migration
 
-Migrate from self-hosted to AWS (see Section 10 for details).
+Migrate from VPS to AWS if you outgrow a single server. See Section 11 for full details. This phase is optional and only needed if:
+- You need high availability (zero downtime during server restarts)
+- You need to handle significantly more than a few thousand users
+- You want managed database backups with point-in-time recovery
+- You want a global CDN for faster page loads worldwide
 
 **Deliverable:** Application running on AWS with managed infrastructure.
 
 ---
 
-## 10. AWS Cloud Migration Plan
+## 10. VPS Deployment Plan
 
-### Why Migrate
+### Architecture on the VPS
 
-| Self-Hosted Limitation | AWS Solution |
+```
+VPS (~$6-12/month)
+┌──────────────────────────────────────────────────────┐
+│                                                      │
+│  UFW Firewall (ports 80, 443, 22 only)               │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐  │
+│  │              Docker Compose                     │  │
+│  │                                                 │  │
+│  │  ┌──────────────────────────────────────────┐   │  │
+│  │  │            Nginx (container)              │   │  │
+│  │  │                                           │   │  │
+│  │  │  :80  → redirect to :443                  │   │  │
+│  │  │  :443 → HTTPS (Let's Encrypt cert)        │   │  │
+│  │  │                                           │   │  │
+│  │  │  /           → serves React static files  │   │  │
+│  │  │  /api/*      → proxy to Spring Boot:8080  │   │  │
+│  │  │  /uploads/*  → serves uploaded images     │   │  │
+│  │  └──────────────────┬───────────────────────┘   │  │
+│  │                     │                            │  │
+│  │  ┌──────────────────┴───────────────────────┐   │  │
+│  │  │       Spring Boot (container)             │   │  │
+│  │  │                                           │   │  │
+│  │  │  :8080 (internal only, not exposed)       │   │  │
+│  │  │  REST API, business logic, auth           │   │  │
+│  │  │  Health check: /actuator/health           │   │  │
+│  │  └──────────────────┬───────────────────────┘   │  │
+│  │                     │                            │  │
+│  │  ┌──────────────────┴───────────────────────┐   │  │
+│  │  │       PostgreSQL 16 (container)           │   │  │
+│  │  │                                           │   │  │
+│  │  │  :5432 (internal only, not exposed)       │   │  │
+│  │  │  Data stored in Docker volume             │   │  │
+│  │  │  Daily pg_dump backups via cron           │   │  │
+│  │  └──────────────────────────────────────────┘   │  │
+│  │                                                 │  │
+│  └─────────────────────────────────────────────────┘  │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+### VPS Provider (To Be Decided)
+
+Provider will be chosen before Phase 4. Top candidates:
+
+| Provider | Starting Price | Strengths |
+|---|---|---|
+| Hetzner | ~$4-7/month | Best price-to-performance, EU + US data centers |
+| DigitalOcean | ~$6-12/month | Most beginner-friendly, excellent tutorials |
+| Linode (Akamai) | ~$5-12/month | Reliable, good community |
+| Vultr | ~$5-10/month | Global locations, competitive pricing |
+
+**Recommended VPS specs for a few thousand users:**
+- 2 vCPUs, 2-4 GB RAM, 40-80 GB SSD
+- Ubuntu 22.04 LTS (or latest LTS)
+- Estimated cost: $6-12/month
+
+### What Gets Installed on the VPS
+
+Only two things need to be installed manually:
+
+1. **Docker + Docker Compose** — runs all application containers
+2. **Certbot** — obtains and auto-renews free SSL certificates from Let's Encrypt
+
+Everything else (Nginx, Spring Boot, PostgreSQL) runs inside Docker containers.
+
+### Deployment Process
+
+**Initial setup (one time):**
+
+```bash
+# 1. SSH into the VPS
+ssh user@your-server-ip
+
+# 2. Install Docker
+curl -fsSL https://get.docker.com | sh
+
+# 3. Clone the repository
+git clone https://github.com/your-repo/blog-platform.git
+cd blog-platform
+
+# 4. Create .env file with production secrets
+cp .env.example .env
+nano .env  # Set DB password, session secret, domain name
+
+# 5. Obtain SSL certificate
+certbot certonly --standalone -d yourdomain.com
+
+# 6. Start everything
+docker compose -f docker-compose.prod.yml up -d
+```
+
+**Updating the app (on each deploy):**
+
+```bash
+# 1. Pull latest code
+git pull
+
+# 2. Rebuild and restart containers (zero-downtime with --no-deps)
+docker compose -f docker-compose.prod.yml build
+docker compose -f docker-compose.prod.yml up -d
+```
+
+### Nginx Configuration
+
+Nginx serves as the single entry point. Key responsibilities:
+
+| Responsibility | How |
 |---|---|
-| You manage hardware, OS updates, security patches | AWS manages infrastructure |
-| Single server = single point of failure | Multi-AZ deployment for high availability |
-| Manual database backups | RDS automated backups with point-in-time recovery |
-| Manual scaling | Auto-scaling based on traffic |
-| SSL certificate management | AWS Certificate Manager (free SSL) |
-| No CDN | CloudFront for global static asset delivery |
+| HTTPS termination | Reads Let's Encrypt certificate, encrypts all traffic |
+| HTTP → HTTPS redirect | All port 80 requests redirected to port 443 |
+| Serve React SPA | Serves static files from `/usr/share/nginx/html` |
+| API reverse proxy | Forwards `/api/*` requests to Spring Boot at `http://backend:8080` |
+| Static file caching | Sets `Cache-Control` headers for CSS/JS/images (long cache, fingerprinted) |
+| Gzip compression | Compresses text responses for faster page loads |
+| Security headers | `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security` |
+| Client-side routing | Returns `index.html` for all non-API, non-file routes (React Router handles routing) |
+
+### Database Backups
+
+Automated daily backups using a cron job inside the PostgreSQL container or on the host:
+
+```
+Schedule: Daily at 3:00 AM
+Method: pg_dump → compressed .sql.gz file
+Storage: /backups/ directory on VPS + optional offsite copy
+Retention: Keep last 7 daily backups, delete older ones
+Restore: pg_restore from any backup file
+```
+
+### Firewall (UFW)
+
+Only three ports open to the internet:
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 22 | TCP | SSH (remote access to the server) |
+| 80 | TCP | HTTP (redirects to HTTPS) |
+| 443 | TCP | HTTPS (all application traffic) |
+
+All other ports (8080 for Spring Boot, 5432 for PostgreSQL) are internal only — Docker containers communicate over an internal network that is not exposed to the internet.
+
+### Monitoring
+
+Lightweight monitoring appropriate for a small deployment:
+
+| What | How |
+|---|---|
+| Container health | Docker health checks (`/actuator/health` for Spring Boot) |
+| Container restarts | Docker Compose `restart: unless-stopped` policy |
+| Disk space | Cron job that alerts if disk usage exceeds 80% |
+| Application logs | `docker compose logs -f` for real-time viewing |
+| Log persistence | Docker logging driver writes to `/var/log/` with rotation |
+| Uptime | Free external monitoring service (e.g., UptimeRobot) pings the health endpoint every 5 minutes |
+
+### Estimated Monthly Cost
+
+| Item | Cost |
+|---|---|
+| VPS (2 vCPU, 2-4 GB RAM) | $6-12 |
+| Domain name | ~$1 (amortized yearly) |
+| SSL certificate | Free (Let's Encrypt) |
+| Monitoring (UptimeRobot) | Free tier |
+| **Total** | **~$7-13/month** |
+
+---
+
+## 11. AWS Cloud Migration Plan (Future / Optional)
+
+This section is a reference for if and when the application outgrows a single VPS. It is **not part of the initial launch plan**.
+
+### When to Consider AWS
+
+- Traffic consistently exceeds what a single VPS can handle
+- You need zero-downtime deployments
+- You need automated database failover
+- You want a global CDN for international users
 
 ### Target AWS Architecture
 
@@ -966,9 +1142,9 @@ Migrate from self-hosted to AWS (see Section 10 for details).
 | Monitoring | CloudWatch | Logs, metrics, alerts |
 | CI/CD | CodePipeline + CodeBuild | Automated build and deploy on git push |
 
-### Migration Steps
+### Migration Steps (VPS → AWS)
 
-1. **Containerize** — Already done in Phase 4 (Dockerfiles exist)
+1. **Containerize** — Already done (Dockerfiles exist from Phase 4)
 2. **Set up RDS** — Create PostgreSQL RDS instance, migrate data with pg_dump/pg_restore
 3. **Set up ECS** — Create ECS Fargate service with the Spring Boot Docker image
 4. **Set up S3 + CloudFront** — Upload React build to S3, configure CloudFront distribution
@@ -979,7 +1155,7 @@ Migrate from self-hosted to AWS (see Section 10 for details).
 
 ### Session Management in Cloud
 
-When moving from a single server to multiple ECS containers, sessions can't be stored in-memory (each container has its own memory). Two options:
+When moving from a single server to multiple ECS containers, sessions can't be stored in-memory. Two options:
 
 | Approach | How It Works | Trade-off |
 |---|---|---|
@@ -1003,7 +1179,7 @@ These are rough estimates for low traffic. AWS Free Tier covers some of this for
 
 ---
 
-## 11. Deferred Features (YAGNI)
+## 12. Deferred Features (YAGNI)
 
 These exist in the original schema or README as future plans. They are deliberately excluded from this design to keep scope manageable:
 
