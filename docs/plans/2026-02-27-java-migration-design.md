@@ -1,8 +1,8 @@
 # BlogPlatformDB — Java Migration Design
 
-**Version:** 4.0
+**Version:** 5.0
 **Last Updated:** 2026-02-28
-**Status:** Draft — Awaiting Final Approval
+**Status:** Approved
 
 ---
 
@@ -14,6 +14,7 @@
 | 2.0 | 2026-02-27 | Angela + Claude | Major expansion + front-end | Added React + TypeScript front-end (Vite, Tailwind, React Query). Expanded all 6 original sections with detailed field-level entity descriptions, DTO listings, response format examples. Added: overall architecture diagram with request flow, monorepo structure, front-end file structure with components/pages/hooks, authentication flow diagram, Spring Security filter chain, CSRF/CORS details, testing pyramid with front-end tests (Vitest, React Testing Library, MSW, Cypress), 5 implementation phases, AWS cloud migration plan with architecture diagram and cost estimates, deferred features list. Added changelog and versioning. |
 | 3.0 | 2026-02-27 | Angela + Claude | Deployment strategy change | Replaced AWS as primary deployment target with VPS (self-hosted). Rationale: AWS is overkill for a few thousand users (~$50-80/month vs ~$6-12/month for a VPS). Added detailed VPS deployment section covering Docker, Nginx, SSL, backups, monitoring, and firewall. Demoted AWS to a future growth option (Phase 5 → optional). Updated implementation phases to reflect VPS as Phase 4 deployment target. Added Nginx architecture diagram and deployment commands. |
 | 4.0 | 2026-02-28 | Angela + Claude | Critical review response | Applied changes from critical design review (v1). **Critical fixes:** (1) Added greenfield deployment declaration — no SQL Server data migration needed, schema only. (2) Replaced in-memory sessions with Redis-backed sessions (Spring Session Data Redis); added Redis to Docker Compose stack. (3) Made subscriber notifications async via `@Async` + `@TransactionalEventListener(AFTER_COMMIT)` to eliminate post-creation bottleneck. (4) Added stored procedure validation checklist mapping each SP to Java equivalent and covering test cases. (5) Added global rate limiting with Bucket4j — tiered: anonymous 60 req/min, authenticated 120 req/min, auth endpoints 10 req/min. (6) Added image upload constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota, disk alert at 70%. **Minor fixes:** (7) Documented `CookieCsrfTokenRepository.withHttpOnlyFalse()` requirement for CSRF. (8) Changed all API endpoints from `/api/` to `/api/v1/` for future versioning. (9) Specified PostgreSQL `tsvector/tsquery` with GIN indexes for full-text search. (10) Added 30-second notification polling interval with exponential backoff on error. (11) Documented Docker Compose single-point-of-failure as known limitation. (12) Extended backup retention: 7 daily + 4 weekly + 3 monthly. (13) Documented HikariCP connection pool defaults. (14) Added PaaS alternatives note for non-technical VPS operators. |
+| 5.0 | 2026-02-28 | Angela + Claude | Critical review response (v2) | Applied changes from critical design review (v2). All six issues from review v1 were confirmed addressed in v4.0. This version resolves five new critical issues and seven minor issues raised against v4.0. **Critical fixes:** (1) Deferred VIP payment processing — `POST /api/v1/users/{id}/upgrade-vip` endpoint and the `payment/` package are now explicitly marked as stubs; no real payment gateway is wired in Phases 1–4. VIP payments moved to Deferred Features with a Stripe Checkout note for Phase 5+. Eliminates the security risk of accepting client-submitted, server-unverified payment data. (2) Specified Markdown as the blog post content format — raw Markdown stored in `content TEXT` column, rendered to sanitized HTML on the front-end via `react-markdown` + `rehype-sanitize`; Markdown syntax stripped before `tsvector` indexing via Flyway trigger. Added Content Format section. (3) Kept Redis session storage (review recommended JDBC for single-VPS simplicity; overruled — Redis is already configured, operational cost is acceptable, and it simplifies the future AWS ElastiCache migration to a connection-string swap). (4) Added full XSS prevention strategy: `rehype-sanitize` for rendered Markdown, Nginx `Content-Security-Policy: script-src 'self'` header, back-end rejection of any HTML in comment text, prohibition on raw `dangerouslySetInnerHTML`. Replaced the vague "input sanitization" Phase 4 bullet with a detailed XSS Prevention section. (5) Added error handling and observability to `@Async` notifications: try-catch with ERROR-level logging (post ID, subscriber count, error), batch `saveAll()` replacing N individual inserts, failure logging by post ID for manual re-notification. **Minor fixes:** (6) Replaced `@Where(clause = "is_deleted = false")` on `BlogPost` with Hibernate `@FilterDef` / `@Filter` to support admin view and restore of soft-deleted posts; added `GET /api/v1/admin/posts/deleted` endpoint to admin section. (7) Added Vite proxy configuration to route `/api` requests to `localhost:8080` during development, eliminating cross-origin session cookie issues without requiring `SameSite=None`. (8) Specified Slack incoming webhook as the alert destination for monitoring cron jobs (disk usage, backup failures). (9) Fixed `@PreUpdate` audit logging: service layer loads the existing post before applying changes, passes captured old values to `PostUpdateLog` — replacing the broken entity listener approach where `@PreUpdate` receives the already-modified entity. (10) Added server-side maximum page size of 100 and documented defaults (page=0, size=20) via `PageableHandlerMethodArgumentResolver`. (11) Removed the incorrect "zero-downtime with `--no-deps`" claim from the deployment commands section; the Known Limitations section already correctly documents the brief restart downtime. (12) Added explicit log level configuration to `application-prod.yml`: `root=WARN`, `com.blogplatform=INFO`, `org.hibernate.SQL=WARN` to prevent Hibernate SQL flooding of production logs. |
 
 ---
 
@@ -22,6 +23,22 @@
 Migrate the BlogPlatformDB SQL Server database project into a full-stack modern web application. The back-end is a Spring Boot REST API with PostgreSQL. The front-end is a React single-page application with TypeScript. The application runs on a self-hosted VPS (Virtual Private Server) for a few thousand users, with Docker and Nginx handling containerization and traffic routing. AWS cloud migration is documented as a future growth option if the application outgrows a single server.
 
 **Data migration scope:** This is a **greenfield deployment** — there is no existing production data in SQL Server that needs to be migrated. The SQL Server project serves as the schema and business logic reference. Flyway migrations will create the PostgreSQL schema from scratch. No data export, transformation, or migration tooling is required.
+
+## Content Format
+
+Blog post content is stored as **raw Markdown** in the `content TEXT` column. This is a foundational decision that affects the editor, rendering pipeline, search indexing, and XSS strategy.
+
+| Layer | Decision |
+|---|---|
+| Storage | Raw Markdown string in PostgreSQL `TEXT` column — the database treats it as plain text |
+| Front-end rendering | `react-markdown` converts Markdown to HTML in the browser; `rehype-sanitize` strips dangerous tags before DOM injection |
+| Post editor | Markdown textarea with a live preview pane (not a WYSIWYG editor) |
+| Full-text search | A Flyway-managed PostgreSQL trigger strips Markdown syntax (removes `##`, `**`, `_`, backticks, links) before populating the `search_vector tsvector` column, so search indexes clean prose rather than formatting symbols |
+| XSS | Markdown is safer than raw HTML as input, and `rehype-sanitize` provides a second layer on render; see XSS Prevention section |
+
+**Rationale:** Storing raw Markdown keeps the database format-agnostic, storage compact (vs HTML which is 2–5× larger), and the source recoverable. Rendering is free (client CPU) and cacheable. This is the approach used by GitHub, GitLab, and most modern content platforms.
+
+---
 
 ## Tech Stack
 
@@ -54,6 +71,7 @@ Migrate the BlogPlatformDB SQL Server database project into a full-stack modern 
 | HTTP client      | Axios                           | Clean API for HTTP requests, interceptors for auth     |
 | Styling          | Tailwind CSS                    | Utility-first CSS, fast to prototype, consistent look  |
 | Forms            | React Hook Form                 | Performant form handling with validation               |
+| Markdown editor  | react-markdown + rehype-sanitize | Render stored Markdown to sanitized HTML; sanitize strips dangerous tags before DOM injection |
 
 ---
 
@@ -200,7 +218,8 @@ backend/src/main/java/com/blogplatform/
 │   ├── PostUpdateLogRepository.java
 │   ├── ReadPostRepository.java
 │   ├── SavedPostRepository.java
-│   ├── PostEntityListener.java       @PostPersist/@PostUpdate → writes PostUpdateLog
+│   ├── PostEntityListener.java       @PostPersist → writes PostUpdateLog on create only.
+│   │                                   Update logging handled in PostService (see Section 6)
 │   └── dto/
 │       ├── PostListResponse.java     Summary: title, author, category, like/comment counts
 │       ├── PostDetailResponse.java   Full post with author, tags, like count
@@ -242,20 +261,25 @@ backend/src/main/java/com/blogplatform/
 │   ├── SubscriptionController.java  POST + DELETE /api/v1/subscriptions
 │   ├── SubscriptionService.java     Subscribe/unsubscribe, expiration check
 │   └── SubscriberRepository.java    findAllActiveSubscribers()
-├── payment/
+├── payment/                          ⚠️  STUB — deferred to Phase 5+. No real payment gateway
+│   │                                   is wired in Phases 1–4. The endpoint exists but returns
+│   │                                   501 Not Implemented. See Deferred Features.
 │   ├── Payment.java                  Entity: payment_id, account_id FK, amount,
 │   │                                   payment_method (enum), transaction_id (unique),
 │   │                                   payment_date
 │   ├── PaymentMethod.java           Enum: CREDIT_CARD, PAYPAL, BANK_TRANSFER
-│   ├── PaymentController.java       POST /api/v1/users/{id}/upgrade-vip delegates here
-│   ├── PaymentService.java          @Transactional: creates payment + sets VIP flags
+│   ├── PaymentController.java       POST /api/v1/users/{id}/upgrade-vip → 501 stub
+│   ├── PaymentService.java          Stub: throws NotImplementedException
 │   └── PaymentRepository.java
 ├── notification/
 │   ├── Notification.java             Entity: notification_id, account_id FK, message,
 │   │                                   is_read, created_at
 │   ├── NotificationController.java  GET /api/v1/notifications,
 │   │                                   PUT /api/v1/notifications/{id}/read
-│   ├── NotificationService.java     notifySubscribers() (@Async, event-driven), markAsRead()
+│   ├── NotificationService.java     notifySubscribers() (@Async, event-driven): batch saveAll(),
+│   │                                   try-catch with ERROR logging (post ID, count, error),
+│   │                                   post ID logged on batch failure for manual re-notification.
+│   │                                   markAsRead()
 │   └── NotificationRepository.java  findByAccountIdOrderByCreatedAtDesc()
 ├── image/
 │   ├── Image.java                    Entity: image_id, post_id FK, image_url,
@@ -308,8 +332,10 @@ frontend/src/
 │   │   └── Layout.tsx                Page wrapper with header/footer
 │   ├── posts/
 │   │   ├── PostCard.tsx              Post preview card for listing pages
-│   │   ├── PostDetail.tsx            Full post view with content
-│   │   ├── PostForm.tsx              Create/edit post form (authors)
+│   │   ├── PostDetail.tsx            Full post view — renders Markdown via react-markdown +
+│   │                               rehype-sanitize (never raw dangerouslySetInnerHTML)
+│   │   ├── PostForm.tsx              Create/edit post form (authors) — Markdown textarea with
+│   │                               live preview pane using react-markdown + rehype-sanitize
 │   │   ├── PostFilters.tsx           Category, tag, author filter controls
 │   │   └── PremiumBadge.tsx          VIP-only content indicator
 │   ├── comments/
@@ -365,6 +391,7 @@ frontend/src/
 - **AuthContext** provides current user state to all components without prop drilling
 - **ProtectedRoute** component wraps pages that require authentication
 - **TypeScript interfaces** mirror the back-end DTOs for type safety across the stack
+- **Vite proxy** configured in `vite.config.ts` to forward `/api` requests to `http://localhost:8080` during development — eliminates cross-origin cookie issues without requiring `SameSite=None` or CORS credential gymnastics. In production, Nginx handles the same proxying.
 
 ---
 
@@ -481,7 +508,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 | GET | `/api/v1/users/{id}` | Authenticated | Get user public profile |
 | PUT | `/api/v1/users/{id}` | Owner only | Update own profile (first_name, last_name, bio, pic) |
 | GET | `/api/v1/users/{id}/saved-posts` | Owner only | List saved/bookmarked posts (paginated) |
-| POST | `/api/v1/users/{id}/upgrade-vip` | Owner only | Submit payment and upgrade to VIP |
+| POST | `/api/v1/users/{id}/upgrade-vip` | Owner only | **STUB — returns 501.** Payment gateway deferred to Phase 5+. |
 
 ### Posts
 | Method | Endpoint | Access | Description |
@@ -495,7 +522,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 | DELETE | `/api/v1/posts/{id}/save` | Authenticated | Remove bookmark |
 
 **Query parameters for GET /api/v1/posts:**
-- `?page=0&size=20` — pagination (default page 0, size 20)
+- `?page=0&size=20` — pagination (default page=0, size=20; maximum size=100 enforced server-side via `PageableHandlerMethodArgumentResolver`)
 - `?category=5` — filter by category ID
 - `?tag=java` — filter by tag name
 - `?author=3` — filter by author ID
@@ -513,6 +540,12 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 |--------|----------|--------|-------------|
 | POST | `/api/v1/posts/{postId}/likes` | Authenticated | Like a post (idempotent, no error if already liked) |
 | DELETE | `/api/v1/posts/{postId}/likes` | Authenticated | Unlike a post |
+
+### Admin
+| Method | Endpoint | Access | Description |
+|--------|----------|--------|-------------|
+| GET | `/api/v1/admin/posts/deleted` | ADMIN | List soft-deleted posts (filter disabled, shows is_deleted=true posts) |
+| PUT | `/api/v1/admin/posts/{id}/restore` | ADMIN | Restore a soft-deleted post (sets is_deleted=false) |
 
 ### Categories
 | Method | Endpoint | Access | Description |
@@ -603,7 +636,7 @@ All endpoints return a consistent JSON structure:
 | SQL Procedure | Java Service Method | Migration Details |
 |---|---|---|
 | `SP_Add_Comment` | `CommentService.addComment()` | 1. Check ReadPost exists for (user, post) → 403 if not. 2. Validate content ≤ 250 chars via `@Size`. 3. If parent_comment_id provided, verify parent exists and belongs to same post. 4. Save Comment entity. |
-| `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | `@Transactional`: 1. Validate payment (amount > 0, method valid). 2. Create Payment record with unique transaction_id. 3. Set UserAccount.is_vip = true, vip_start_date = now, vip_end_date = now + 1 year. If any step fails, everything rolls back. |
+| `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | ⚠️ **STUB in Phases 1–4** — returns 501. Future: Stripe webhook confirmation → set VIP flags server-side. No client-submitted payment data accepted. |
 | `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | Triggered asynchronously via `@TransactionalEventListener(phase = AFTER_COMMIT)` after PostService.createPost() commits. Runs in a background thread (`@Async`). Queries all active subscribers (expiration_date null or > now). Creates a Notification for each: "New post: {title} by {author}". Decoupled from the post creation transaction to prevent subscriber count from affecting post creation latency. |
 | `SP_Backup_All_DB` | Not migrated | Database backups handled by pg_dump cron job on the server (or AWS RDS automated backups in cloud phase). |
 | `SP_Backup_Database` | Not migrated | Same as above. |
@@ -613,8 +646,8 @@ All endpoints return a consistent JSON structure:
 | SQL Trigger | Java Equivalent | Migration Details |
 |---|---|---|
 | `TR_BlogPosts_Insert_Log` | `PostEntityListener.postPersist()` | `@PostPersist`: creates a PostUpdateLog entry with the new post's title and content. |
-| `TR_BlogPosts_Update_Log` | `PostEntityListener.postUpdate()` | `@PostUpdate`: creates a PostUpdateLog entry with old and new title/content. Uses `@PreUpdate` to capture old values before Hibernate flushes. |
-| `TR_BlogPosts_Delete_Log` | `PostService.deletePost()` | No trigger. Service method sets `is_deleted = true` and `updated_at = now`. The post remains in the database but is excluded from all queries via a default `@Where(clause = "is_deleted = false")`. |
+| `TR_BlogPosts_Update_Log` | `PostService.updatePost()` | Service layer loads the existing post from the database before applying changes, captures old title/content, applies updates, then writes a `PostUpdateLog` with both old and new values. **Note:** `@PreUpdate` is not used for this — JPA entity listeners receive the entity in its already-modified state and cannot reliably capture old values without reading from the database first. |
+| `TR_BlogPosts_Delete_Log` | `PostService.deletePost()` | Service method sets `is_deleted = true` and `updated_at = now`. The post remains in the database. A Hibernate `@FilterDef` / `@Filter` named `activePostsFilter` (clause: `is_deleted = false`) is enabled by default for all public queries. Admin queries explicitly disable the filter to expose soft-deleted posts for the admin restore endpoint. This replaces the former `@Where` annotation, which was a global, non-toggleable filter that prevented admin access to deleted posts. |
 | `TR_Notify_Subscribers_On_New_Post` | `PostService.createPost()` publishes `NewPostEvent` | After the post transaction commits, Spring's `@TransactionalEventListener` triggers `NotificationService.notifySubscribers()` asynchronously in a background thread. Decoupled from the post creation transaction — post creation is fast regardless of subscriber count. |
 
 ### Functions → Repository Queries
@@ -646,8 +679,8 @@ Each stored procedure's business rules must be covered by specific test cases to
 | SQL Stored Procedure | Java Equivalent | Business Rules to Validate | Test Cases |
 |---|---|---|---|
 | `SP_Add_Comment` | `CommentService.addComment()` | 1. Post must exist and not be deleted. 2. User must have read the post. 3. Comment text must not be empty. 4. Comment text ≤ 250 chars. 5. Parent comment must exist and belong to same post. | Unit: mock ReadPost lookup → reject if not read. Unit: content > 250 chars → validation error. Integration: full comment flow with threading. |
-| `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | 1. Amount must be positive. 2. Payment method must be valid enum. 3. Transaction ID must be unique. 4. Sets is_vip=true, vip_start_date=now, vip_end_date=now+1yr. 5. All-or-nothing transaction (rollback on failure). | Unit: negative amount → rejection. Integration: full payment → VIP flags verified. Integration: duplicate transaction_id → constraint violation. |
-| `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | 1. Only active subscribers notified (expiration_date null or > now). 2. Expired subscribers skipped. 3. Notification message includes post title and author name. 4. Runs async — does not block post creation. | Unit: N active + M expired subscribers → N notifications created. Integration: create post → verify notifications exist after async processing. |
+| `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | ⚠️ **STUB in Phases 1–4.** Returns 501. Full business rules deferred to Phase 5+ with Stripe integration. | Stub test: endpoint returns 501. Phase 5+: webhook sets VIP flags, duplicate webhook idempotency. |
+| `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | 1. Only active subscribers notified (expiration_date null or > now). 2. Expired subscribers skipped. 3. Notification message includes post title and author name. 4. Runs async — does not block post creation. 5. All notifications batch-inserted via single `saveAll()`. 6. Any exception caught, logged at ERROR level with post ID and subscriber count. Post ID logged to allow manual re-notification. | Unit: N active + M expired subscribers → N notifications created. Unit: batch failure → ERROR logged with post ID. Integration: create post → verify notifications exist after async processing. |
 | `SP_Backup_All_DB` / `SP_Backup_Database` | pg_dump cron job | Not migrated to Java. Validated by ops: verify pg_dump runs on schedule, backups are restorable. | Manual: restore from backup to a test database, verify data integrity. |
 
 ### Full-Text Search Strategy
@@ -656,7 +689,7 @@ Full-text search on `GET /api/v1/posts?search=` uses PostgreSQL's native full-te
 
 - **Implementation:** `tsvector` column on `BlogPost` (combining title and content), queried with `tsquery`
 - **Index:** GIN index on the `tsvector` column for fast lookups
-- **Flyway migration:** Adds a `search_vector` column of type `tsvector`, a GIN index, and a trigger to keep it updated on INSERT/UPDATE
+- **Flyway migration:** Adds a `search_vector` column of type `tsvector`, a GIN index, and a trigger to keep it updated on INSERT/UPDATE. The trigger strips Markdown syntax (removes `##`, `**`, `_`, backtick fences, and link syntax) before building the `tsvector` so that formatting characters do not appear in search indexes or results
 - **Repository:** Custom `@Query` using `plainto_tsquery()` for user-friendly search input
 - **Relevance:** Results ranked by `ts_rank()` for relevance ordering
 - **Why not ILIKE:** `ILIKE` requires a sequential scan and does not scale. `tsvector/tsquery` with GIN indexes provides sub-millisecond lookups regardless of table size.
@@ -825,7 +858,7 @@ Test service methods in isolation by mocking repositories and other dependencies
 | PostService | Create post → calls notifySubscribers. Soft-delete sets is_deleted. Premium post access denied for non-VIP. |
 | CommentService | Reject comment if user hasn't read post. Reject comment over 250 chars. Validate parent comment belongs to same post. |
 | LikeService | Prevent duplicate likes. Unlike non-existent like → no error. |
-| PaymentService | upgradeToVip creates payment + sets VIP flags. Negative amount → validation error. |
+| PaymentService | ⚠️ Stub in Phases 1–4: upgradeToVip returns 501. |
 | NotificationService | notifySubscribers creates N notifications for N active subscribers. Skip expired subscribers. |
 
 #### Integration Tests (Testcontainers + Spring Boot Test)
@@ -837,7 +870,8 @@ Spin up a real PostgreSQL container and test the full stack from controller to d
 | Auth flow | Register → login → access protected endpoint → logout → rejected |
 | Post CRUD | Create → read (marked as read) → update (log created) → soft delete (not in listings) |
 | Comment threading | Create post → read it → comment → reply to comment → verify thread structure |
-| VIP upgrade | Create payment → VIP flags set → access premium post → success |
+| VIP upgrade | ⚠️ Stub test: POST upgrade-vip → 501. Full flow deferred to Phase 5+. |
+| Soft delete + admin restore | Delete post (is_deleted=true) → not in public listing → admin GET deleted posts → visible → admin restore → visible in public listing |
 | Pagination | Create 25 posts → request page 0 size 10 → verify 10 results, totalPages = 3 |
 | Filtering | Create posts in categories → filter by category → correct results |
 | Security | Access AUTHOR endpoint as USER → 403. Access own profile → 200. Access other's profile edit → 403. |
@@ -921,7 +955,7 @@ Build out the full REST API.
 - Saved posts / bookmarking
 - Author profiles with JSON social links
 - Subscription and async notification system (`@Async` + `@TransactionalEventListener(AFTER_COMMIT)`)
-- VIP upgrade with payment processing
+- VIP upgrade endpoint (stub — returns 501; Stripe integration deferred to Phase 5+)
 - Image upload (local filesystem) with constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota
 - SpringDoc OpenAPI / Swagger documentation
 - Integration tests for all endpoints
@@ -938,7 +972,7 @@ Build the React application.
 - Build auth pages (login, register) + AuthContext
 - Build post listing page with filters, pagination, search
 - Build post detail page with comments, likes, read tracking
-- Build post creation/editing for authors
+- Build post creation/editing for authors — Markdown textarea with live preview (react-markdown + rehype-sanitize)
 - Build user profile page with edit functionality
 - Build saved posts page
 - Build notifications page (30-second polling interval, exponential backoff on error)
@@ -963,7 +997,7 @@ Deploy to a VPS and prepare for real users. See Section 10 for full deployment d
 - Health check endpoint (`/actuator/health`)
 - Database backup script (pg_dump cron job: 7 daily + 4 weekly + 3 monthly retention)
 - Global rate limiting already configured in Phase 1 (Bucket4j)
-- Input sanitization for XSS prevention
+- XSS prevention (see XSS Prevention section below)
 - Performance: connection pooling (HikariCP, default in Spring Boot), query optimization
 - Basic monitoring with Docker health checks and log alerts
 
@@ -1091,7 +1125,7 @@ docker compose -f docker-compose.prod.yml up -d
 # 1. Pull latest code
 git pull
 
-# 2. Rebuild and restart containers (zero-downtime with --no-deps)
+# 2. Rebuild and restart containers (brief downtime during Spring Boot container restart — see Known Limitations)
 docker compose -f docker-compose.prod.yml build
 docker compose -f docker-compose.prod.yml up -d
 ```
@@ -1108,7 +1142,7 @@ Nginx serves as the single entry point. Key responsibilities:
 | API reverse proxy | Forwards `/api/v1/*` requests to Spring Boot at `http://backend:8080` |
 | Static file caching | Sets `Cache-Control` headers for CSS/JS/images (long cache, fingerprinted) |
 | Gzip compression | Compresses text responses for faster page loads |
-| Security headers | `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security` |
+| Security headers | `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Content-Security-Policy: script-src 'self'` (blocks inline script execution) |
 | Client-side routing | Returns `index.html` for all non-API, non-file routes (React Router handles routing) |
 
 ### Database Backups
@@ -1148,10 +1182,38 @@ Lightweight monitoring appropriate for a small deployment:
 |---|---|
 | Container health | Docker health checks (`/actuator/health` for Spring Boot) |
 | Container restarts | Docker Compose `restart: unless-stopped` policy |
-| Disk space | Cron job that alerts if disk usage exceeds 70% (critical for image uploads) |
+| Disk space | Cron job that alerts if disk usage exceeds 70% (critical for image uploads) — alert sent to Slack incoming webhook |
+| Backup failure | pg_dump cron job exit code checked; failure sends alert to Slack incoming webhook |
+| Alert channel | Free Slack incoming webhook — one `curl` call from any cron job; no additional infrastructure required |
 | Application logs | `docker compose logs -f` for real-time viewing |
 | Log persistence | Docker logging driver writes to `/var/log/` with rotation |
 | Uptime | Free external monitoring service (e.g., UptimeRobot) pings the health endpoint every 5 minutes |
+
+### XSS Prevention
+
+User-generated content (blog posts, comments) requires a layered XSS defence strategy:
+
+| Layer | Measure |
+|---|---|
+| Front-end rendering | All Markdown is rendered via `react-markdown` + `rehype-sanitize`. `rehype-sanitize` strips disallowed HTML tags (e.g., `<script>`, `<iframe>`, event handlers) before DOM injection. **Never use raw `dangerouslySetInnerHTML` on unsanitized content anywhere in the app.** |
+| Content-Security-Policy | Nginx adds `Content-Security-Policy: script-src 'self'` header on all responses. This blocks inline `<script>` execution even if sanitization were bypassed, providing a second line of defence. |
+| Comment validation | Back-end `CommentService` rejects any comment text containing HTML tags (`<` / `>` characters). Comments are plain text (250 chars max) — no markup is permitted or needed. |
+| Post content | Content is stored as raw Markdown (never as HTML). XSS vectors in raw Markdown are neutralized at render time by `rehype-sanitize`. The back-end does not attempt to sanitize Markdown on ingest — the sanitization boundary is the front-end renderer. |
+
+### Log Level Configuration (`application-prod.yml`)
+
+Without explicit log levels, Spring Boot's default configuration floods production logs with DEBUG-level Hibernate SQL output (every query, every parameter binding). The following configuration is required in `application-prod.yml`:
+
+```yaml
+logging:
+  level:
+    root: WARN
+    com.blogplatform: INFO
+    org.hibernate.SQL: WARN
+    org.springframework.web: WARN
+```
+
+This ensures application events are captured at INFO, framework noise is suppressed to WARN, and only unexpected errors surface prominently. Structured JSON logging (already documented) operates at this level configuration.
 
 ### Known Limitations
 
@@ -1295,3 +1357,4 @@ These exist in the original schema or README as future plans. They are deliberat
 - **Email verification** — Not needed for initial launch
 - **Password reset** — Can be added later
 - **Real-time notifications** — Polling is sufficient at this scale, WebSockets later if needed
+- **VIP payment processing** — The `POST /api/v1/users/{id}/upgrade-vip` endpoint is a stub (returns 501) in Phases 1–4. Phase 5+ will integrate Stripe Checkout: redirect to Stripe → receive webhook confirmation → set VIP flags server-side in the webhook handler. Client-submitted payment data (amount, transaction ID) must never be trusted without server-side verification against the payment processor.
