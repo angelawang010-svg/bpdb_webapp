@@ -1,0 +1,24 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SQL Server specific
+*.mdf
+*.ldf
+*.bak
+*.trn
+
+# Database connection configs
+*.publish.xml
+*.sqlproj.user
+
+# Environment / secrets
+.env
+*.env
