@@ -1,7 +1,7 @@
 # BlogPlatformDB — Java Migration Design
 
-**Version:** 3.0
-**Last Updated:** 2026-02-27
+**Version:** 4.0
+**Last Updated:** 2026-02-28
 **Status:** Draft — Awaiting Final Approval
 
 ---
@@ -13,12 +13,15 @@
 | 1.0 | 2026-02-27 | Angela + Claude | Initial design | Back-end only design with Spring Boot, PostgreSQL, REST API. Covered 6 sections: project structure, entity model, API endpoints, business logic migration, security & auth, testing strategy. |
 | 2.0 | 2026-02-27 | Angela + Claude | Major expansion + front-end | Added React + TypeScript front-end (Vite, Tailwind, React Query). Expanded all 6 original sections with detailed field-level entity descriptions, DTO listings, response format examples. Added: overall architecture diagram with request flow, monorepo structure, front-end file structure with components/pages/hooks, authentication flow diagram, Spring Security filter chain, CSRF/CORS details, testing pyramid with front-end tests (Vitest, React Testing Library, MSW, Cypress), 5 implementation phases, AWS cloud migration plan with architecture diagram and cost estimates, deferred features list. Added changelog and versioning. |
 | 3.0 | 2026-02-27 | Angela + Claude | Deployment strategy change | Replaced AWS as primary deployment target with VPS (self-hosted). Rationale: AWS is overkill for a few thousand users (~$50-80/month vs ~$6-12/month for a VPS). Added detailed VPS deployment section covering Docker, Nginx, SSL, backups, monitoring, and firewall. Demoted AWS to a future growth option (Phase 5 → optional). Updated implementation phases to reflect VPS as Phase 4 deployment target. Added Nginx architecture diagram and deployment commands. |
+| 4.0 | 2026-02-28 | Angela + Claude | Critical review response | Applied changes from critical design review (v1). **Critical fixes:** (1) Added greenfield deployment declaration — no SQL Server data migration needed, schema only. (2) Replaced in-memory sessions with Redis-backed sessions (Spring Session Data Redis); added Redis to Docker Compose stack. (3) Made subscriber notifications async via `@Async` + `@TransactionalEventListener(AFTER_COMMIT)` to eliminate post-creation bottleneck. (4) Added stored procedure validation checklist mapping each SP to Java equivalent and covering test cases. (5) Added global rate limiting with Bucket4j — tiered: anonymous 60 req/min, authenticated 120 req/min, auth endpoints 10 req/min. (6) Added image upload constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota, disk alert at 70%. **Minor fixes:** (7) Documented `CookieCsrfTokenRepository.withHttpOnlyFalse()` requirement for CSRF. (8) Changed all API endpoints from `/api/` to `/api/v1/` for future versioning. (9) Specified PostgreSQL `tsvector/tsquery` with GIN indexes for full-text search. (10) Added 30-second notification polling interval with exponential backoff on error. (11) Documented Docker Compose single-point-of-failure as known limitation. (12) Extended backup retention: 7 daily + 4 weekly + 3 monthly. (13) Documented HikariCP connection pool defaults. (14) Added PaaS alternatives note for non-technical VPS operators. |
 
 ---
 
 ## Overview
 
 Migrate the BlogPlatformDB SQL Server database project into a full-stack modern web application. The back-end is a Spring Boot REST API with PostgreSQL. The front-end is a React single-page application with TypeScript. The application runs on a self-hosted VPS (Virtual Private Server) for a few thousand users, with Docker and Nginx handling containerization and traffic routing. AWS cloud migration is documented as a future growth option if the application outgrows a single server.
+
+**Data migration scope:** This is a **greenfield deployment** — there is no existing production data in SQL Server that needs to be migrated. The SQL Server project serves as the schema and business logic reference. Flyway migrations will create the PostgreSQL schema from scratch. No data export, transformation, or migration tooling is required.
 
 ## Tech Stack
 
@@ -32,7 +35,9 @@ Migrate the BlogPlatformDB SQL Server database project into a full-stack modern 
 | Database         | PostgreSQL 16                   | Free, feature-rich, native JSON and full-text search   |
 | ORM              | Spring Data JPA (Hibernate)     | Reduces boilerplate, type-safe queries                 |
 | DB migrations    | Flyway                          | Versioned, repeatable schema migrations                |
-| Authentication   | Spring Security (session-based) | Simple for single-server, cookie-based sessions        |
+| Authentication   | Spring Security (session-based) | Cookie-based sessions, backed by Redis                 |
+| Session store    | Spring Session Data Redis       | Sessions persist across restarts and redeploys         |
+| Rate limiting    | Bucket4j                        | Global rate limiting with tiered limits per user type  |
 | Validation       | Jakarta Bean Validation         | Declarative constraints via annotations                |
 | API docs         | SpringDoc OpenAPI (Swagger)     | Auto-generated interactive API documentation           |
 | Containerization | Docker + Docker Compose         | Consistent environments, easy local dev setup          |
@@ -106,7 +111,7 @@ Migrate the BlogPlatformDB SQL Server database project into a full-stack modern 
 ### Request Flow
 
 1. User interacts with React UI in the browser
-2. React sends HTTP request to Spring Boot API (`/api/*`)
+2. React sends HTTP request to Spring Boot API (`/api/v1/*`)
 3. Spring Security filter chain checks session cookie, CSRF token, and rate limits
 4. Controller receives the request, validates input via Bean Validation
 5. Controller calls the appropriate service method
@@ -129,7 +134,7 @@ blog-platform/
 │   ├── tsconfig.json
 │   ├── vite.config.ts
 │   └── src/
-├── docker-compose.yml                (PostgreSQL + full stack for local dev)
+├── docker-compose.yml                (PostgreSQL + Redis + full stack for local dev)
 ├── Dockerfile.backend
 ├── Dockerfile.frontend
 └── docs/
@@ -148,7 +153,8 @@ backend/src/main/java/com/blogplatform/
 │   ├── SecurityConfig.java           Session config, CSRF, CORS, auth entry points
 │   ├── WebConfig.java                CORS mappings for React dev server
 │   ├── AuditConfig.java              Enables JPA auditing (@CreatedDate, etc.)
-│   └── RateLimitConfig.java          Rate limiting for auth endpoints
+│   ├── RateLimitConfig.java          Global rate limiting with Bucket4j (tiered by user type)
+│   └── RedisConfig.java              Redis connection for Spring Session
 ├── user/
 │   ├── UserAccount.java              Entity: account_id, username, email, password_hash,
 │   │                                   role, is_vip, vip_start_date, vip_end_date,
@@ -156,9 +162,9 @@ backend/src/main/java/com/blogplatform/
 │   ├── UserProfile.java              Entity: profile_id, first_name, last_name, bio,
 │   │                                   profile_pic_url, last_login, login_count
 │   ├── Role.java                     Enum: ADMIN, AUTHOR, USER
-│   ├── UserController.java           GET /api/users/{id}, PUT /api/users/{id},
-│   │                                   GET /api/users/{id}/saved-posts,
-│   │                                   POST /api/users/{id}/upgrade-vip
+│   ├── UserController.java           GET /api/v1/users/{id}, PUT /api/v1/users/{id},
+│   │                                   GET /api/v1/users/{id}/saved-posts,
+│   │                                   POST /api/v1/users/{id}/upgrade-vip
 │   ├── UserService.java              Profile CRUD, VIP upgrade orchestration
 │   ├── UserRepository.java           JPA repository, existsByUsername(), existsByEmail()
 │   └── dto/
@@ -166,8 +172,8 @@ backend/src/main/java/com/blogplatform/
 │       ├── UpdateProfileRequest.java Validated input for profile updates
 │       └── VipUpgradeRequest.java    Payment details for VIP upgrade
 ├── auth/
-│   ├── AuthController.java           POST /api/auth/register, /login, /logout,
-│   │                                   GET /api/auth/me (current user)
+│   ├── AuthController.java           POST /api/v1/auth/register, /login, /logout,
+│   │                                   GET /api/v1/auth/me (current user)
 │   ├── AuthService.java              Registration, password hashing, session creation
 │   └── dto/
 │       ├── RegisterRequest.java      username, email, password (validated)
@@ -176,7 +182,7 @@ backend/src/main/java/com/blogplatform/
 ├── author/
 │   ├── AuthorProfile.java            Entity: author_id, biography, social_links (JSON),
 │   │                                   expertise, account_id FK
-│   ├── AuthorController.java         GET /api/authors, GET /api/authors/{id}
+│   ├── AuthorController.java         GET /api/v1/authors, GET /api/v1/authors/{id}
 │   ├── AuthorService.java            Author listing, profile with post aggregation
 │   └── AuthorRepository.java
 ├── post/
@@ -204,9 +210,9 @@ backend/src/main/java/com/blogplatform/
 │   ├── Comment.java                  Entity: comment_id, content, account_id FK,
 │   │                                   post_id FK, parent_comment_id (self-ref),
 │   │                                   created_at
-│   ├── CommentController.java        GET /api/posts/{id}/comments,
-│   │                                   POST /api/posts/{id}/comments,
-│   │                                   DELETE /api/comments/{id}
+│   ├── CommentController.java        GET /api/v1/posts/{id}/comments,
+│   │                                   POST /api/v1/posts/{id}/comments,
+│   │                                   DELETE /api/v1/comments/{id}
 │   ├── CommentService.java           Validates read-before-comment, 250-char limit,
 │   │                                   builds threaded response
 │   ├── CommentRepository.java        findByPostIdAndParentCommentIsNull() for top-level
@@ -216,24 +222,24 @@ backend/src/main/java/com/blogplatform/
 ├── like/
 │   ├── Like.java                     Entity: like_id, account_id FK, post_id FK,
 │   │                                   created_at. Unique(account_id, post_id)
-│   ├── LikeController.java          POST + DELETE /api/posts/{id}/likes
+│   ├── LikeController.java          POST + DELETE /api/v1/posts/{id}/likes
 │   ├── LikeService.java             Toggle logic, prevents duplicates
 │   └── LikeRepository.java          countByPostId(), existsByAccountIdAndPostId()
 ├── tag/
 │   ├── Tag.java                      Entity: tag_id, tag_name (unique)
-│   ├── TagController.java           GET /api/tags, POST /api/tags (admin)
+│   ├── TagController.java           GET /api/v1/tags, POST /api/v1/tags (admin)
 │   ├── TagService.java
 │   └── TagRepository.java           findByTagNameIn() for bulk lookup
 ├── category/
 │   ├── Category.java                 Entity: category_id, category_name (unique),
 │   │                                   description
-│   ├── CategoryController.java      GET /api/categories, POST /api/categories (admin)
+│   ├── CategoryController.java      GET /api/v1/categories, POST /api/v1/categories (admin)
 │   ├── CategoryService.java
 │   └── CategoryRepository.java
 ├── subscription/
 │   ├── Subscriber.java               Entity: subscriber_id, account_id FK (unique),
 │   │                                   subscribed_at, expiration_date
-│   ├── SubscriptionController.java  POST + DELETE /api/subscriptions
+│   ├── SubscriptionController.java  POST + DELETE /api/v1/subscriptions
 │   ├── SubscriptionService.java     Subscribe/unsubscribe, expiration check
 │   └── SubscriberRepository.java    findAllActiveSubscribers()
 ├── payment/
@@ -241,22 +247,24 @@ backend/src/main/java/com/blogplatform/
 │   │                                   payment_method (enum), transaction_id (unique),
 │   │                                   payment_date
 │   ├── PaymentMethod.java           Enum: CREDIT_CARD, PAYPAL, BANK_TRANSFER
-│   ├── PaymentController.java       POST /api/users/{id}/upgrade-vip delegates here
+│   ├── PaymentController.java       POST /api/v1/users/{id}/upgrade-vip delegates here
 │   ├── PaymentService.java          @Transactional: creates payment + sets VIP flags
 │   └── PaymentRepository.java
 ├── notification/
 │   ├── Notification.java             Entity: notification_id, account_id FK, message,
 │   │                                   is_read, created_at
-│   ├── NotificationController.java  GET /api/notifications,
-│   │                                   PUT /api/notifications/{id}/read
-│   ├── NotificationService.java     notifySubscribers(), markAsRead()
+│   ├── NotificationController.java  GET /api/v1/notifications,
+│   │                                   PUT /api/v1/notifications/{id}/read
+│   ├── NotificationService.java     notifySubscribers() (@Async, event-driven), markAsRead()
 │   └── NotificationRepository.java  findByAccountIdOrderByCreatedAtDesc()
 ├── image/
 │   ├── Image.java                    Entity: image_id, post_id FK, image_url,
 │   │                                   alt_text, uploaded_at
-│   ├── ImageController.java         POST /api/posts/{id}/images,
-│   │                                   DELETE /api/images/{id}
-│   ├── ImageService.java            Upload to local filesystem (→ S3 in cloud phase)
+│   ├── ImageController.java         POST /api/v1/posts/{id}/images,
+│   │                                   DELETE /api/v1/images/{id}
+│   ├── ImageService.java            Upload to local filesystem (→ S3 in cloud phase).
+│   │                                   Constraints: 5 MB max, JPEG/PNG/WebP only,
+│   │                                   filename sanitization, 100 MB per-user quota
 │   └── ImageRepository.java
 └── common/
     ├── exception/
@@ -324,7 +332,7 @@ frontend/src/
 │   ├── useAuth.ts                    Auth context: current user, login state
 │   ├── usePosts.ts                   React Query hooks for post CRUD
 │   ├── useComments.ts                React Query hooks for comments
-│   └── useNotifications.ts           React Query hooks + polling for notifications
+│   └── useNotifications.ts           React Query hooks + polling (30s interval, exponential backoff on error)
 ├── pages/
 │   ├── HomePage.tsx                  Post feed with filters and pagination
 │   ├── PostPage.tsx                  Single post view + comments + likes
@@ -462,88 +470,88 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 ### Auth
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| POST | `/api/auth/register` | Public | Create account (username, email, password) |
-| POST | `/api/auth/login` | Public | Authenticate, create session, return user info |
-| POST | `/api/auth/logout` | Authenticated | Destroy session, invalidate cookie |
-| GET | `/api/auth/me` | Authenticated | Return current user info (used by React on page load) |
+| POST | `/api/v1/auth/register` | Public | Create account (username, email, password) |
+| POST | `/api/v1/auth/login` | Public | Authenticate, create session, return user info |
+| POST | `/api/v1/auth/logout` | Authenticated | Destroy session, invalidate cookie |
+| GET | `/api/v1/auth/me` | Authenticated | Return current user info (used by React on page load) |
 
 ### Users
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/users/{id}` | Authenticated | Get user public profile |
-| PUT | `/api/users/{id}` | Owner only | Update own profile (first_name, last_name, bio, pic) |
-| GET | `/api/users/{id}/saved-posts` | Owner only | List saved/bookmarked posts (paginated) |
-| POST | `/api/users/{id}/upgrade-vip` | Owner only | Submit payment and upgrade to VIP |
+| GET | `/api/v1/users/{id}` | Authenticated | Get user public profile |
+| PUT | `/api/v1/users/{id}` | Owner only | Update own profile (first_name, last_name, bio, pic) |
+| GET | `/api/v1/users/{id}/saved-posts` | Owner only | List saved/bookmarked posts (paginated) |
+| POST | `/api/v1/users/{id}/upgrade-vip` | Owner only | Submit payment and upgrade to VIP |
 
 ### Posts
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/posts` | Public | List posts (paginated, filterable) |
-| GET | `/api/posts/{id}` | Public* | Get single post (marks as read). *Premium → VIP only |
-| POST | `/api/posts` | AUTHOR, ADMIN | Create new post |
-| PUT | `/api/posts/{id}` | Owner, ADMIN | Update post |
-| DELETE | `/api/posts/{id}` | Owner, ADMIN | Soft-delete post (sets is_deleted = true) |
-| POST | `/api/posts/{id}/save` | Authenticated | Bookmark a post |
-| DELETE | `/api/posts/{id}/save` | Authenticated | Remove bookmark |
+| GET | `/api/v1/posts` | Public | List posts (paginated, filterable) |
+| GET | `/api/v1/posts/{id}` | Public* | Get single post (marks as read). *Premium → VIP only |
+| POST | `/api/v1/posts` | AUTHOR, ADMIN | Create new post |
+| PUT | `/api/v1/posts/{id}` | Owner, ADMIN | Update post |
+| DELETE | `/api/v1/posts/{id}` | Owner, ADMIN | Soft-delete post (sets is_deleted = true) |
+| POST | `/api/v1/posts/{id}/save` | Authenticated | Bookmark a post |
+| DELETE | `/api/v1/posts/{id}/save` | Authenticated | Remove bookmark |
 
-**Query parameters for GET /api/posts:**
+**Query parameters for GET /api/v1/posts:**
 - `?page=0&size=20` — pagination (default page 0, size 20)
 - `?category=5` — filter by category ID
 - `?tag=java` — filter by tag name
 - `?author=3` — filter by author ID
-- `?search=spring+boot` — full-text search on title and content
+- `?search=spring+boot` — full-text search on title and content using PostgreSQL `tsvector/tsquery` with GIN indexes for performance and relevance ranking
 
 ### Comments
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/posts/{postId}/comments` | Public | Get threaded comments for a post |
-| POST | `/api/posts/{postId}/comments` | Authenticated | Add comment (must have read the post first) |
-| DELETE | `/api/comments/{id}` | Owner, ADMIN | Delete a comment |
+| GET | `/api/v1/posts/{postId}/comments` | Public | Get threaded comments for a post |
+| POST | `/api/v1/posts/{postId}/comments` | Authenticated | Add comment (must have read the post first) |
+| DELETE | `/api/v1/comments/{id}` | Owner, ADMIN | Delete a comment |
 
 ### Likes
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| POST | `/api/posts/{postId}/likes` | Authenticated | Like a post (idempotent, no error if already liked) |
-| DELETE | `/api/posts/{postId}/likes` | Authenticated | Unlike a post |
+| POST | `/api/v1/posts/{postId}/likes` | Authenticated | Like a post (idempotent, no error if already liked) |
+| DELETE | `/api/v1/posts/{postId}/likes` | Authenticated | Unlike a post |
 
 ### Categories
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/categories` | Public | List all categories |
-| POST | `/api/categories` | ADMIN | Create a category |
-| PUT | `/api/categories/{id}` | ADMIN | Update a category |
-| DELETE | `/api/categories/{id}` | ADMIN | Delete a category |
+| GET | `/api/v1/categories` | Public | List all categories |
+| POST | `/api/v1/categories` | ADMIN | Create a category |
+| PUT | `/api/v1/categories/{id}` | ADMIN | Update a category |
+| DELETE | `/api/v1/categories/{id}` | ADMIN | Delete a category |
 
 ### Tags
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/tags` | Public | List all tags |
-| POST | `/api/tags` | ADMIN | Create a tag |
+| GET | `/api/v1/tags` | Public | List all tags |
+| POST | `/api/v1/tags` | ADMIN | Create a tag |
 
 ### Authors
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/authors` | Public | List all authors with post counts |
-| GET | `/api/authors/{id}` | Public | Get author profile + their posts (paginated) |
+| GET | `/api/v1/authors` | Public | List all authors with post counts |
+| GET | `/api/v1/authors/{id}` | Public | Get author profile + their posts (paginated) |
 
 ### Subscriptions
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| POST | `/api/subscriptions` | Authenticated | Subscribe to new post notifications |
-| DELETE | `/api/subscriptions` | Authenticated | Unsubscribe |
+| POST | `/api/v1/subscriptions` | Authenticated | Subscribe to new post notifications |
+| DELETE | `/api/v1/subscriptions` | Authenticated | Unsubscribe |
 
 ### Notifications
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/notifications` | Authenticated | Get own notifications (paginated, newest first) |
-| PUT | `/api/notifications/{id}/read` | Owner only | Mark a notification as read |
-| PUT | `/api/notifications/read-all` | Authenticated | Mark all notifications as read |
+| GET | `/api/v1/notifications` | Authenticated | Get own notifications (paginated, newest first) |
+| PUT | `/api/v1/notifications/{id}/read` | Owner only | Mark a notification as read |
+| PUT | `/api/v1/notifications/read-all` | Authenticated | Mark all notifications as read |
 
 ### Images
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| POST | `/api/posts/{postId}/images` | AUTHOR, ADMIN | Upload image for a post |
-| DELETE | `/api/images/{id}` | Owner, ADMIN | Delete an image |
+| POST | `/api/v1/posts/{postId}/images` | AUTHOR, ADMIN | Upload image for a post |
+| DELETE | `/api/v1/images/{id}` | Owner, ADMIN | Delete an image |
 
 ### Response Format
 
@@ -596,7 +604,7 @@ All endpoints return a consistent JSON structure:
 |---|---|---|
 | `SP_Add_Comment` | `CommentService.addComment()` | 1. Check ReadPost exists for (user, post) → 403 if not. 2. Validate content ≤ 250 chars via `@Size`. 3. If parent_comment_id provided, verify parent exists and belongs to same post. 4. Save Comment entity. |
 | `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | `@Transactional`: 1. Validate payment (amount > 0, method valid). 2. Create Payment record with unique transaction_id. 3. Set UserAccount.is_vip = true, vip_start_date = now, vip_end_date = now + 1 year. If any step fails, everything rolls back. |
-| `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | Called by PostService.createPost(). Queries all active subscribers (expiration_date null or > now). Creates a Notification for each: "New post: {title} by {author}". |
+| `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | Triggered asynchronously via `@TransactionalEventListener(phase = AFTER_COMMIT)` after PostService.createPost() commits. Runs in a background thread (`@Async`). Queries all active subscribers (expiration_date null or > now). Creates a Notification for each: "New post: {title} by {author}". Decoupled from the post creation transaction to prevent subscriber count from affecting post creation latency. |
 | `SP_Backup_All_DB` | Not migrated | Database backups handled by pg_dump cron job on the server (or AWS RDS automated backups in cloud phase). |
 | `SP_Backup_Database` | Not migrated | Same as above. |
 
@@ -607,7 +615,7 @@ All endpoints return a consistent JSON structure:
 | `TR_BlogPosts_Insert_Log` | `PostEntityListener.postPersist()` | `@PostPersist`: creates a PostUpdateLog entry with the new post's title and content. |
 | `TR_BlogPosts_Update_Log` | `PostEntityListener.postUpdate()` | `@PostUpdate`: creates a PostUpdateLog entry with old and new title/content. Uses `@PreUpdate` to capture old values before Hibernate flushes. |
 | `TR_BlogPosts_Delete_Log` | `PostService.deletePost()` | No trigger. Service method sets `is_deleted = true` and `updated_at = now`. The post remains in the database but is excluded from all queries via a default `@Where(clause = "is_deleted = false")`. |
-| `TR_Notify_Subscribers_On_New_Post` | `PostService.createPost()` | After saving the post, explicitly calls `notificationService.notifySubscribers(post)`. Explicit call is preferable to a hidden trigger. |
+| `TR_Notify_Subscribers_On_New_Post` | `PostService.createPost()` publishes `NewPostEvent` | After the post transaction commits, Spring's `@TransactionalEventListener` triggers `NotificationService.notifySubscribers()` asynchronously in a background thread. Decoupled from the post creation transaction — post creation is fast regardless of subscriber count. |
 
 ### Functions → Repository Queries
 
@@ -631,6 +639,65 @@ All endpoints return a consistent JSON structure:
 | `View_Recent_Comments` | `CommentRepository.findRecentComments(Pageable)` | `findAllByOrderByCreatedAtDesc(Pageable)` |
 | Other views | Similar repository methods | Each view maps to a query method with appropriate DTO projection |
 
+### Stored Procedure Validation Checklist
+
+Each stored procedure's business rules must be covered by specific test cases to ensure migration correctness.
+
+| SQL Stored Procedure | Java Equivalent | Business Rules to Validate | Test Cases |
+|---|---|---|---|
+| `SP_Add_Comment` | `CommentService.addComment()` | 1. Post must exist and not be deleted. 2. User must have read the post. 3. Comment text must not be empty. 4. Comment text ≤ 250 chars. 5. Parent comment must exist and belong to same post. | Unit: mock ReadPost lookup → reject if not read. Unit: content > 250 chars → validation error. Integration: full comment flow with threading. |
+| `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | 1. Amount must be positive. 2. Payment method must be valid enum. 3. Transaction ID must be unique. 4. Sets is_vip=true, vip_start_date=now, vip_end_date=now+1yr. 5. All-or-nothing transaction (rollback on failure). | Unit: negative amount → rejection. Integration: full payment → VIP flags verified. Integration: duplicate transaction_id → constraint violation. |
+| `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | 1. Only active subscribers notified (expiration_date null or > now). 2. Expired subscribers skipped. 3. Notification message includes post title and author name. 4. Runs async — does not block post creation. | Unit: N active + M expired subscribers → N notifications created. Integration: create post → verify notifications exist after async processing. |
+| `SP_Backup_All_DB` / `SP_Backup_Database` | pg_dump cron job | Not migrated to Java. Validated by ops: verify pg_dump runs on schedule, backups are restorable. | Manual: restore from backup to a test database, verify data integrity. |
+
+### Full-Text Search Strategy
+
+Full-text search on `GET /api/v1/posts?search=` uses PostgreSQL's native full-text search:
+
+- **Implementation:** `tsvector` column on `BlogPost` (combining title and content), queried with `tsquery`
+- **Index:** GIN index on the `tsvector` column for fast lookups
+- **Flyway migration:** Adds a `search_vector` column of type `tsvector`, a GIN index, and a trigger to keep it updated on INSERT/UPDATE
+- **Repository:** Custom `@Query` using `plainto_tsquery()` for user-friendly search input
+- **Relevance:** Results ranked by `ts_rank()` for relevance ordering
+- **Why not ILIKE:** `ILIKE` requires a sequential scan and does not scale. `tsvector/tsquery` with GIN indexes provides sub-millisecond lookups regardless of table size.
+
+### Image Upload Constraints
+
+| Constraint | Value | Implementation |
+|---|---|---|
+| Maximum file size | 5 MB | `spring.servlet.multipart.max-file-size=5MB` in application.yml |
+| Allowed MIME types | JPEG, PNG, WebP | Validated in `ImageService` before saving — reject others with 400 |
+| Filename sanitization | Strip path separators, special chars, use UUID-based filenames | `ImageService` generates `{uuid}.{ext}` to prevent path traversal |
+| Per-user storage quota | 100 MB | `ImageService` tracks cumulative upload size per user, rejects when exceeded |
+| Disk usage alert | 70% threshold | Cron job or health check alerts when VPS disk usage exceeds 70% |
+
+### Rate Limiting Strategy
+
+Global rate limiting using Bucket4j, applied via a servlet filter in the Spring Security filter chain.
+
+| User Type | Limit | Scope |
+|---|---|---|
+| Anonymous (no session) | 60 requests/minute | Per IP address |
+| Authenticated user | 120 requests/minute | Per user account |
+| Auth endpoints (`/api/v1/auth/**`) | 10 requests/minute | Per IP address (prevents brute force) |
+
+- Bucket4j integrates with Spring Boot and supports in-memory token buckets
+- Rate limit headers (`X-Rate-Limit-Remaining`, `Retry-After`) included in responses
+- Exceeded limits return `429 Too Many Requests`
+
+### Connection Pool Configuration
+
+HikariCP (Spring Boot default) manages the database connection pool.
+
+| Setting | Value | Rationale |
+|---|---|---|
+| `maximumPoolSize` | 10 (default) | Appropriate for a 2 vCPU VPS. Rule of thumb: `(2 * CPU cores) + disk spindles` |
+| `minimumIdle` | 10 (same as max) | HikariCP recommendation: keep pool full to avoid connection creation latency |
+| `connectionTimeout` | 30000 ms | Default. Time to wait for a connection from the pool before throwing an exception |
+| `idleTimeout` | 600000 ms | Default. Connections idle longer than this are retired |
+
+Async notifications reduce pool contention — notification INSERTs no longer happen inside the post creation transaction.
+
 ---
 
 ## 7. Authentication & Security
@@ -640,7 +707,7 @@ All endpoints return a consistent JSON structure:
 ```
 Browser                     Spring Boot
   │                            │
-  │  POST /api/auth/login      │
+  │  POST /api/v1/auth/login      │
   │  { username, password }    │
   │ ──────────────────────────>│
   │                            │  1. AuthService.login()
@@ -651,11 +718,11 @@ Browser                     Spring Boot
   │  Set-Cookie: JSESSIONID    │
   │ <──────────────────────────│
   │                            │
-  │  GET /api/posts            │
+  │  GET /api/v1/posts            │
   │  Cookie: JSESSIONID=abc    │
   │ ──────────────────────────>│
   │                            │  1. SessionFilter extracts cookie
-  │                            │  2. Look up session in session store
+  │                            │  2. Look up session in Redis
   │                            │  3. Load SecurityContext (user + roles)
   │                            │  4. Proceed to controller
   │  200 OK + posts data       │
@@ -671,7 +738,7 @@ SecurityFilterChain:
   3. Session filter       → Extract session from JSESSIONID cookie
   4. Authentication       → Load user from session into SecurityContext
   5. Authorization        → Check @PreAuthorize rules on the endpoint
-  6. Rate limit filter    → Throttle auth endpoints (10 requests/minute/IP)
+  6. Rate limit filter    → Bucket4j global rate limiting (tiered: anon 60/min, auth 120/min, login 10/min)
 ```
 
 ### Password Security
@@ -685,7 +752,7 @@ SecurityFilterChain:
 ### CSRF Protection
 
 - Spring Security generates a CSRF token per session
-- Token sent to React via a cookie (`XSRF-TOKEN`)
+- Token sent to React via a cookie (`XSRF-TOKEN`) using `CookieCsrfTokenRepository.withHttpOnlyFalse()` — the `withHttpOnlyFalse()` is required so JavaScript can read the cookie; without it, the cookie is HttpOnly and Axios cannot access it, silently breaking all POST/PUT/DELETE requests
 - React's Axios interceptor reads the cookie and sends the token in `X-XSRF-TOKEN` header
 - All POST/PUT/DELETE requests validated against this token
 
@@ -697,24 +764,27 @@ SecurityFilterChain:
 
 ### Session Management
 
-- Sessions stored in-memory (default Spring Boot HttpSession)
+- Sessions stored in **Redis** via Spring Session Data Redis
+- Redis runs as a Docker container alongside the application (included in Docker Compose)
 - Session timeout: 30 minutes of inactivity
 - Session fixation protection: create new session on login
 - Single session per user (optional, can be relaxed)
+- Sessions persist across application restarts and redeploys — no user-visible disruption during deployments
+- Direct upgrade path to AWS ElastiCache Redis when migrating to cloud (same protocol, change connection string only)
 
 ### Authorization Rules
 
 | Endpoint Pattern | Rule |
 |---|---|
-| `POST /api/auth/**` | Public (permitAll) |
-| `GET /api/posts`, `GET /api/posts/{id}` | Public |
-| `GET /api/categories`, `GET /api/tags` | Public |
-| `GET /api/authors`, `GET /api/authors/{id}` | Public |
-| `POST /api/posts` | `hasRole('AUTHOR')` or `hasRole('ADMIN')` |
-| `PUT/DELETE /api/posts/{id}` | Owner or `hasRole('ADMIN')` |
-| `POST /api/posts/{id}/comments` | Authenticated + must have read the post |
-| `POST/DELETE /api/categories`, `/api/tags` | `hasRole('ADMIN')` |
-| `PUT /api/users/{id}` | Owner only |
+| `POST /api/v1/auth/**` | Public (permitAll) |
+| `GET /api/v1/posts`, `GET /api/v1/posts/{id}` | Public |
+| `GET /api/v1/categories`, `GET /api/v1/tags` | Public |
+| `GET /api/v1/authors`, `GET /api/v1/authors/{id}` | Public |
+| `POST /api/v1/posts` | `hasRole('AUTHOR')` or `hasRole('ADMIN')` |
+| `PUT/DELETE /api/v1/posts/{id}` | Owner or `hasRole('ADMIN')` |
+| `POST /api/v1/posts/{id}/comments` | Authenticated + must have read the post |
+| `POST/DELETE /api/v1/categories`, `/api/v1/tags` | `hasRole('ADMIN')` |
+| `PUT /api/v1/users/{id}` | Owner only |
 | Everything else | Authenticated |
 
 ### Deferred Security Features (YAGNI)
@@ -826,16 +896,17 @@ npm run test:e2e                  # Cypress E2E tests
 Set up the project skeleton and core data layer.
 
 - Initialize Gradle project with Spring Boot 3.x, Java 21
-- Set up Docker Compose with PostgreSQL 16
-- Configure Flyway and write migration scripts for all 17 tables
+- Set up Docker Compose with PostgreSQL 16 and Redis 7
+- Configure Flyway and write migration scripts for all 17 tables (including `search_vector` tsvector column with GIN index)
 - Implement JPA entities for all tables with relationships and validation
-- Configure Spring Security with session-based auth
-- Implement auth endpoints (register, login, logout, /me)
+- Configure Spring Security with session-based auth (Redis-backed sessions via Spring Session Data Redis)
+- Configure Bucket4j global rate limiting (tiered: anonymous 60/min, authenticated 120/min, auth 10/min)
+- Implement auth endpoints (register, login, logout, /me) under `/api/v1/`
 - Implement Role enum and authorization rules
 - Set up GlobalExceptionHandler and ApiResponse wrapper
 - Write unit and integration tests for auth flow
 
-**Deliverable:** Running Spring Boot app with auth, database schema, and all entities.
+**Deliverable:** Running Spring Boot app with auth, Redis sessions, rate limiting, database schema, and all entities.
 
 ### Phase 2: Core Features (Back-End API)
 
@@ -849,13 +920,14 @@ Build out the full REST API.
 - Category and tag management
 - Saved posts / bookmarking
 - Author profiles with JSON social links
-- Subscription and notification system
+- Subscription and async notification system (`@Async` + `@TransactionalEventListener(AFTER_COMMIT)`)
 - VIP upgrade with payment processing
-- Image upload (local filesystem storage)
+- Image upload (local filesystem) with constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota
 - SpringDoc OpenAPI / Swagger documentation
 - Integration tests for all endpoints
+- Stored procedure validation checklist: verify all SP business rules covered by test cases
 
-**Deliverable:** Complete, tested REST API with Swagger docs.
+**Deliverable:** Complete, tested REST API with Swagger docs. All stored procedure business rules validated.
 
 ### Phase 3: Front-End
 
@@ -869,7 +941,7 @@ Build the React application.
 - Build post creation/editing for authors
 - Build user profile page with edit functionality
 - Build saved posts page
-- Build notifications page
+- Build notifications page (30-second polling interval, exponential backoff on error)
 - Build admin dashboard (category/tag management)
 - Implement premium content indicators and VIP access
 - Component tests with Vitest + React Testing Library
@@ -889,8 +961,8 @@ Deploy to a VPS and prepare for real users. See Section 10 for full deployment d
 - UFW firewall configuration (allow only ports 80, 443, 22)
 - Logging configuration (structured JSON logs, log rotation)
 - Health check endpoint (`/actuator/health`)
-- Database backup script (pg_dump cron job, daily backups, 7-day retention)
-- Rate limiting on all auth endpoints
+- Database backup script (pg_dump cron job: 7 daily + 4 weekly + 3 monthly retention)
+- Global rate limiting already configured in Phase 1 (Bucket4j)
 - Input sanitization for XSS prevention
 - Performance: connection pooling (HikariCP, default in Spring Boot), query optimization
 - Basic monitoring with Docker health checks and log alerts
@@ -929,7 +1001,7 @@ VPS (~$6-12/month)
 │  │  │  :443 → HTTPS (Let's Encrypt cert)        │   │  │
 │  │  │                                           │   │  │
 │  │  │  /           → serves React static files  │   │  │
-│  │  │  /api/*      → proxy to Spring Boot:8080  │   │  │
+│  │  │  /api/v1/*   → proxy to Spring Boot:8080  │   │  │
 │  │  │  /uploads/*  → serves uploaded images     │   │  │
 │  │  └──────────────────┬───────────────────────┘   │  │
 │  │                     │                            │  │
@@ -947,6 +1019,14 @@ VPS (~$6-12/month)
 │  │  │  :5432 (internal only, not exposed)       │   │  │
 │  │  │  Data stored in Docker volume             │   │  │
 │  │  │  Daily pg_dump backups via cron           │   │  │
+│  │  └──────────────────────────────────────────┘   │  │
+│  │                                                 │  │
+│  │  ┌──────────────────────────────────────────┐   │  │
+│  │  │       Redis 7 (container)                 │   │  │
+│  │  │                                           │   │  │
+│  │  │  :6379 (internal only, not exposed)       │   │  │
+│  │  │  Session storage (Spring Session)         │   │  │
+│  │  │  ~50 MB RAM footprint                     │   │  │
 │  │  └──────────────────────────────────────────┘   │  │
 │  │                                                 │  │
 │  └─────────────────────────────────────────────────┘  │
@@ -1025,7 +1105,7 @@ Nginx serves as the single entry point. Key responsibilities:
 | HTTPS termination | Reads Let's Encrypt certificate, encrypts all traffic |
 | HTTP → HTTPS redirect | All port 80 requests redirected to port 443 |
 | Serve React SPA | Serves static files from `/usr/share/nginx/html` |
-| API reverse proxy | Forwards `/api/*` requests to Spring Boot at `http://backend:8080` |
+| API reverse proxy | Forwards `/api/v1/*` requests to Spring Boot at `http://backend:8080` |
 | Static file caching | Sets `Cache-Control` headers for CSS/JS/images (long cache, fingerprinted) |
 | Gzip compression | Compresses text responses for faster page loads |
 | Security headers | `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security` |
@@ -1039,9 +1119,14 @@ Automated daily backups using a cron job inside the PostgreSQL container or on t
 Schedule: Daily at 3:00 AM
 Method: pg_dump → compressed .sql.gz file
 Storage: /backups/ directory on VPS + optional offsite copy
-Retention: Keep last 7 daily backups, delete older ones
+Retention:
+  - Daily backups: keep last 7
+  - Weekly backups (every Sunday): keep last 4 (30 days)
+  - Monthly backups (1st of month): keep last 3 (90 days)
 Restore: pg_restore from any backup file
 ```
+
+This extended retention protects against data corruption bugs that go unnoticed for more than a week. Storage cost is negligible (compressed PostgreSQL dumps for a small database are typically a few MB each).
 
 ### Firewall (UFW)
 
@@ -1063,10 +1148,31 @@ Lightweight monitoring appropriate for a small deployment:
 |---|---|
 | Container health | Docker health checks (`/actuator/health` for Spring Boot) |
 | Container restarts | Docker Compose `restart: unless-stopped` policy |
-| Disk space | Cron job that alerts if disk usage exceeds 80% |
+| Disk space | Cron job that alerts if disk usage exceeds 70% (critical for image uploads) |
 | Application logs | `docker compose logs -f` for real-time viewing |
 | Log persistence | Docker logging driver writes to `/var/log/` with rotation |
 | Uptime | Free external monitoring service (e.g., UptimeRobot) pings the health endpoint every 5 minutes |
+
+### Known Limitations
+
+**Docker Compose as production orchestrator:** Docker Compose is designed for development and single-host deployments. Known limitations:
+- No built-in health-check-based restart orchestration (relies on `restart: unless-stopped`)
+- No rolling updates — `docker compose up -d` causes brief downtime during container recreation
+- No blue-green deployment capability out of the box
+
+These are acceptable at this scale. **Future improvement path:** Docker Swarm (minimal migration from Compose) or a simple blue-green deploy script that brings up a new container, health-checks it, then swaps Nginx upstream.
+
+### PaaS Alternatives (For Non-Technical Operators)
+
+If the VPS operator is not comfortable with SSH, Docker, and Nginx/Certbot, consider a PaaS (Platform as a Service) instead. These cost slightly more but eliminate server management:
+
+| Provider | Estimated Cost | Strengths |
+|---|---|---|
+| Railway | ~$10-20/month | Easiest to deploy, auto-SSL, git push deploys |
+| Render | ~$10-25/month | Free tier for experiments, managed PostgreSQL |
+| Fly.io | ~$10-20/month | Global edge deployment, Docker-native |
+
+The application is fully containerized (Dockerfiles exist), so migration to any PaaS is straightforward. The VPS deployment docs remain the primary reference.
 
 ### Estimated Monthly Cost
 
@@ -1155,14 +1261,11 @@ This section is a reference for if and when the application outgrows a single VP
 
 ### Session Management in Cloud
 
-When moving from a single server to multiple ECS containers, sessions can't be stored in-memory. Two options:
+Since the application already uses Redis-backed sessions (Spring Session Data Redis) from Phase 1, the cloud migration is straightforward:
 
-| Approach | How It Works | Trade-off |
-|---|---|---|
-| **Spring Session + Redis (ElastiCache)** | Sessions stored in Redis, shared across all containers | Adds a Redis dependency but is the standard approach |
-| **Sticky sessions on ALB** | ALB routes a user to the same container every time | Simpler but less resilient (container restart = logged out) |
-
-**Recommendation:** Start with sticky sessions (simpler). Switch to Redis if you need more resilience or scale beyond a few containers.
+- **Replace local Redis container with AWS ElastiCache Redis** — same protocol, change connection string only
+- Sessions are automatically shared across all ECS containers with no code changes
+- ElastiCache provides managed Redis with automatic failover, patching, and monitoring
 
 ### Estimated AWS Costs (Few Thousand Users)
 
