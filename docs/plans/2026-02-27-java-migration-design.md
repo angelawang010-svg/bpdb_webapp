@@ -1,7 +1,7 @@
 # BlogPlatformDB — Java Migration Design
 
-**Version:** 5.0
-**Last Updated:** 2026-02-28
+**Version:** 6.0
+**Last Updated:** 2026-03-01
 **Status:** Approved
 
 ---
@@ -14,6 +14,7 @@
 | 2.0 | 2026-02-27 | Angela + Claude | Major expansion + front-end | Added React + TypeScript front-end (Vite, Tailwind, React Query). Expanded all 6 original sections with detailed field-level entity descriptions, DTO listings, response format examples. Added: overall architecture diagram with request flow, monorepo structure, front-end file structure with components/pages/hooks, authentication flow diagram, Spring Security filter chain, CSRF/CORS details, testing pyramid with front-end tests (Vitest, React Testing Library, MSW, Cypress), 5 implementation phases, AWS cloud migration plan with architecture diagram and cost estimates, deferred features list. Added changelog and versioning. |
 | 3.0 | 2026-02-27 | Angela + Claude | Deployment strategy change | Replaced AWS as primary deployment target with VPS (self-hosted). Rationale: AWS is overkill for a few thousand users (~$50-80/month vs ~$6-12/month for a VPS). Added detailed VPS deployment section covering Docker, Nginx, SSL, backups, monitoring, and firewall. Demoted AWS to a future growth option (Phase 5 → optional). Updated implementation phases to reflect VPS as Phase 4 deployment target. Added Nginx architecture diagram and deployment commands. |
 | 4.0 | 2026-02-28 | Angela + Claude | Critical review response | Applied changes from critical design review (v1). **Critical fixes:** (1) Added greenfield deployment declaration — no SQL Server data migration needed, schema only. (2) Replaced in-memory sessions with Redis-backed sessions (Spring Session Data Redis); added Redis to Docker Compose stack. (3) Made subscriber notifications async via `@Async` + `@TransactionalEventListener(AFTER_COMMIT)` to eliminate post-creation bottleneck. (4) Added stored procedure validation checklist mapping each SP to Java equivalent and covering test cases. (5) Added global rate limiting with Bucket4j — tiered: anonymous 60 req/min, authenticated 120 req/min, auth endpoints 10 req/min. (6) Added image upload constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota, disk alert at 70%. **Minor fixes:** (7) Documented `CookieCsrfTokenRepository.withHttpOnlyFalse()` requirement for CSRF. (8) Changed all API endpoints from `/api/` to `/api/v1/` for future versioning. (9) Specified PostgreSQL `tsvector/tsquery` with GIN indexes for full-text search. (10) Added 30-second notification polling interval with exponential backoff on error. (11) Documented Docker Compose single-point-of-failure as known limitation. (12) Extended backup retention: 7 daily + 4 weekly + 3 monthly. (13) Documented HikariCP connection pool defaults. (14) Added PaaS alternatives note for non-technical VPS operators. |
+| 6.0 | 2026-03-01 | Angela + Claude | Critical review response (v3) | Applied changes from critical design review (v3). All issues from reviews v1 and v2 were confirmed addressed in v5.0. This version resolves five critical issues, seven minor issues, and four clarification questions raised against v5.0. **Critical fixes:** (1) Moved password reset from Deferred to Phase 2 — baseline authentication requirement, not optional. Two new endpoints: `POST /api/v1/auth/forgot-password` and `POST /api/v1/auth/reset-password` using time-limited single-use tokens via transactional email service. (2) Added notification retention policy: composite index on `(account_id, is_read, created_at)`, auto-delete read notifications older than 90 days via scheduled cleanup job, scoped "mark all as read" to `WHERE is_read = false`. (3) Added `email_verified BOOLEAN DEFAULT false` column to UserAccount schema; email verification implemented in Phase 2 alongside password reset using same transactional email infrastructure. Enforced before password reset and VIP upgrade. (4) Capped comment nesting depth at 3 levels — `CommentService.addComment()` walks parent chain and re-parents if depth exceeds limit. (5) Documented ReadPost "must read before commenting" semantics: opening the post page satisfies the requirement (original SP behavior). Added 1-year retention policy for ReadPost entries. **Minor fixes:** (6) Added SSH hardening note: key-based auth only, password authentication disabled, fail2ban installed. (7) Added `Access-Control-Max-Age: 3600` to CORS configuration for preflight caching. (8) Documented UserProfile/UserAccount split rationale: separates auth data from display data, preserves original SQL Server schema design. (9) Added `@Size(max = 100000)` on blog post `content` field to prevent oversized submissions (~100 KB Markdown limit). (10) Clarified `Subscriber.expiration_date` semantics: always null in Phases 1–4 (free, permanent subscriptions); field exists for future Phase 5+ VIP-tied or time-limited scenarios. (11) Added monthly automated backup verification: restore latest backup to temporary Docker PostgreSQL container, run integrity checks, destroy container. (12) Documented Flyway migration naming convention: `V1__initial_schema.sql`, `V2__seed_data.sql`, `R__search_vector_trigger.sql`. **Clarification resolutions:** (13) AUTHOR role is admin-assigned only via admin dashboard. (14) Account deletion deferred — documented as known gap in Deferred Features. (15) 250-character comment limit confirmed as intentional business rule from original SQL Server SP. |
 | 5.0 | 2026-02-28 | Angela + Claude | Critical review response (v2) | Applied changes from critical design review (v2). All six issues from review v1 were confirmed addressed in v4.0. This version resolves five new critical issues and seven minor issues raised against v4.0. **Critical fixes:** (1) Deferred VIP payment processing — `POST /api/v1/users/{id}/upgrade-vip` endpoint and the `payment/` package are now explicitly marked as stubs; no real payment gateway is wired in Phases 1–4. VIP payments moved to Deferred Features with a Stripe Checkout note for Phase 5+. Eliminates the security risk of accepting client-submitted, server-unverified payment data. (2) Specified Markdown as the blog post content format — raw Markdown stored in `content TEXT` column, rendered to sanitized HTML on the front-end via `react-markdown` + `rehype-sanitize`; Markdown syntax stripped before `tsvector` indexing via Flyway trigger. Added Content Format section. (3) Kept Redis session storage (review recommended JDBC for single-VPS simplicity; overruled — Redis is already configured, operational cost is acceptable, and it simplifies the future AWS ElastiCache migration to a connection-string swap). (4) Added full XSS prevention strategy: `rehype-sanitize` for rendered Markdown, Nginx `Content-Security-Policy: script-src 'self'` header, back-end rejection of any HTML in comment text, prohibition on raw `dangerouslySetInnerHTML`. Replaced the vague "input sanitization" Phase 4 bullet with a detailed XSS Prevention section. (5) Added error handling and observability to `@Async` notifications: try-catch with ERROR-level logging (post ID, subscriber count, error), batch `saveAll()` replacing N individual inserts, failure logging by post ID for manual re-notification. **Minor fixes:** (6) Replaced `@Where(clause = "is_deleted = false")` on `BlogPost` with Hibernate `@FilterDef` / `@Filter` to support admin view and restore of soft-deleted posts; added `GET /api/v1/admin/posts/deleted` endpoint to admin section. (7) Added Vite proxy configuration to route `/api` requests to `localhost:8080` during development, eliminating cross-origin session cookie issues without requiring `SameSite=None`. (8) Specified Slack incoming webhook as the alert destination for monitoring cron jobs (disk usage, backup failures). (9) Fixed `@PreUpdate` audit logging: service layer loads the existing post before applying changes, passes captured old values to `PostUpdateLog` — replacing the broken entity listener approach where `@PreUpdate` receives the already-modified entity. (10) Added server-side maximum page size of 100 and documented defaults (page=0, size=20) via `PageableHandlerMethodArgumentResolver`. (11) Removed the incorrect "zero-downtime with `--no-deps`" claim from the deployment commands section; the Known Limitations section already correctly documents the brief restart downtime. (12) Added explicit log level configuration to `application-prod.yml`: `root=WARN`, `com.blogplatform=INFO`, `org.hibernate.SQL=WARN` to prevent Hibernate SQL flooding of production logs. |
 
 ---
@@ -176,9 +177,12 @@ backend/src/main/java/com/blogplatform/
 ├── user/
 │   ├── UserAccount.java              Entity: account_id, username, email, password_hash,
 │   │                                   role, is_vip, vip_start_date, vip_end_date,
-│   │                                   two_factor_enabled, created_at
+│   │                                   two_factor_enabled, email_verified, created_at
 │   ├── UserProfile.java              Entity: profile_id, first_name, last_name, bio,
 │   │                                   profile_pic_url, last_login, login_count
+│   │                                   Note: separate entity from UserAccount to separate
+│   │                                   auth data from display data (preserves original
+│   │                                   SQL Server schema design)
 │   ├── Role.java                     Enum: ADMIN, AUTHOR, USER
 │   ├── UserController.java           GET /api/v1/users/{id}, PUT /api/v1/users/{id},
 │   │                                   GET /api/v1/users/{id}/saved-posts,
@@ -191,12 +195,22 @@ backend/src/main/java/com/blogplatform/
 │       └── VipUpgradeRequest.java    Payment details for VIP upgrade
 ├── auth/
 │   ├── AuthController.java           POST /api/v1/auth/register, /login, /logout,
-│   │                                   GET /api/v1/auth/me (current user)
-│   ├── AuthService.java              Registration, password hashing, session creation
+│   │                                   GET /api/v1/auth/me (current user),
+│   │                                   POST /api/v1/auth/forgot-password,
+│   │                                   POST /api/v1/auth/reset-password,
+│   │                                   POST /api/v1/auth/verify-email
+│   ├── AuthService.java              Registration, password hashing, session creation,
+│   │                                   password reset tokens, email verification tokens
+│   ├── PasswordResetToken.java       Entity: token (unique), account_id FK, expires_at,
+│   │                                   used (boolean). Single-use, time-limited.
+│   ├── EmailVerificationToken.java   Entity: token (unique), account_id FK, expires_at,
+│   │                                   used (boolean). Single-use, time-limited.
 │   └── dto/
 │       ├── RegisterRequest.java      username, email, password (validated)
 │       ├── LoginRequest.java         username, password
-│       └── AuthResponse.java         user info + role returned after login
+│       ├── AuthResponse.java         user info + role returned after login
+│       ├── ForgotPasswordRequest.java email
+│       └── ResetPasswordRequest.java  token, new_password
 ├── author/
 │   ├── AuthorProfile.java            Entity: author_id, biography, social_links (JSON),
 │   │                                   expertise, account_id FK
@@ -223,7 +237,8 @@ backend/src/main/java/com/blogplatform/
 │   └── dto/
 │       ├── PostListResponse.java     Summary: title, author, category, like/comment counts
 │       ├── PostDetailResponse.java   Full post with author, tags, like count
-│       ├── CreatePostRequest.java    title, content, category_id, tag_ids, is_premium
+│       ├── CreatePostRequest.java    title, content (@Size(max=100000) ~100KB Markdown),
+│       │                               category_id, tag_ids, is_premium
 │       └── UpdatePostRequest.java    Same fields, all optional
 ├── comment/
 │   ├── Comment.java                  Entity: comment_id, content, account_id FK,
@@ -233,7 +248,8 @@ backend/src/main/java/com/blogplatform/
 │   │                                   POST /api/v1/posts/{id}/comments,
 │   │                                   DELETE /api/v1/comments/{id}
 │   ├── CommentService.java           Validates read-before-comment, 250-char limit,
-│   │                                   builds threaded response
+│   │                                   builds threaded response, enforces max nesting
+│   │                                   depth of 3 levels (re-parents deeper replies)
 │   ├── CommentRepository.java        findByPostIdAndParentCommentIsNull() for top-level
 │   └── dto/
 │       ├── CommentResponse.java      Nested structure with replies list
@@ -257,7 +273,9 @@ backend/src/main/java/com/blogplatform/
 │   └── CategoryRepository.java
 ├── subscription/
 │   ├── Subscriber.java               Entity: subscriber_id, account_id FK (unique),
-│   │                                   subscribed_at, expiration_date
+│   │                                   subscribed_at, expiration_date (always null in
+│   │                                   Phases 1–4: subscriptions are free and permanent;
+│   │                                   field exists for Phase 5+ VIP-tied scenarios)
 │   ├── SubscriptionController.java  POST + DELETE /api/v1/subscriptions
 │   ├── SubscriptionService.java     Subscribe/unsubscribe, expiration check
 │   └── SubscriberRepository.java    findAllActiveSubscribers()
@@ -279,8 +297,10 @@ backend/src/main/java/com/blogplatform/
 │   ├── NotificationService.java     notifySubscribers() (@Async, event-driven): batch saveAll(),
 │   │                                   try-catch with ERROR logging (post ID, count, error),
 │   │                                   post ID logged on batch failure for manual re-notification.
-│   │                                   markAsRead()
-│   └── NotificationRepository.java  findByAccountIdOrderByCreatedAtDesc()
+│   │                                   markAsRead(). cleanupOldNotifications(): scheduled job
+│   │                                   deletes read notifications older than 90 days.
+│   └── NotificationRepository.java  findByAccountIdOrderByCreatedAtDesc().
+│                                      Composite index on (account_id, is_read, created_at)
 ├── image/
 │   ├── Image.java                    Entity: image_id, post_id FK, image_url,
 │   │                                   alt_text, uploaded_at
@@ -457,8 +477,8 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 
 | SQL Server Table | Java Entity | Key Mappings |
 |---|---|---|
-| UserAccount | `UserAccount.java` | password → BCrypt hash, role → enum, is_vip/vip_start/vip_end preserved |
-| UserProfile | `UserProfile.java` | `@OneToOne` with UserAccount, cascade ALL |
+| UserAccount | `UserAccount.java` | password → BCrypt hash, role → enum, is_vip/vip_start/vip_end preserved, `email_verified BOOLEAN DEFAULT false` |
+| UserProfile | `UserProfile.java` | `@OneToOne` with UserAccount, cascade ALL. Separate entity to isolate auth data from display data (preserves original SQL Server schema design). |
 | Role | `Role.java` (enum) | ADMIN, AUTHOR, USER — no table needed, stored as string in UserAccount |
 
 #### Content
@@ -476,7 +496,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 
 | SQL Server Table | Java Entity | Key Mappings |
 |---|---|---|
-| Comments | `Comment.java` | `@ManyToOne` self-reference (parent_comment_id), `@Size(max=250)` on content |
+| Comments | `Comment.java` | `@ManyToOne` self-reference (parent_comment_id), `@Size(max=250)` on content, max nesting depth: 3 levels |
 | Likes | `Like.java` | `@Table(uniqueConstraints)` on (account_id, post_id) |
 | ReadPost | `ReadPost.java` | Composite key (account_id, post_id) via `@IdClass` |
 | SavedPosts | `SavedPost.java` | Composite key (account_id, post_id) via `@IdClass` |
@@ -487,8 +507,8 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 |---|---|---|
 | AuthorProfile | `AuthorProfile.java` | social_links as `@JdbcTypeCode(SqlTypes.JSON)` for native PostgreSQL JSON |
 | Payment | `Payment.java` | payment_method → PaymentMethod enum, `@Positive` on amount, transaction_id unique |
-| Subscriber | `Subscriber.java` | `@OneToOne` with UserAccount, expiration_date nullable |
-| Notifications | `Notification.java` | Created by NotificationService, is_read boolean |
+| Subscriber | `Subscriber.java` | `@OneToOne` with UserAccount, expiration_date nullable (always null in Phases 1–4: subscriptions are free and permanent; field exists for Phase 5+ VIP-tied or time-limited scenarios) |
+| Notifications | `Notification.java` | Created by NotificationService, is_read boolean. Composite index on `(account_id, is_read, created_at)`. Retention: read notifications older than 90 days auto-deleted by scheduled cleanup job. |
 
 ---
 
@@ -497,10 +517,13 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 ### Auth
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| POST | `/api/v1/auth/register` | Public | Create account (username, email, password) |
+| POST | `/api/v1/auth/register` | Public | Create account (username, email, password). Sends verification email. |
 | POST | `/api/v1/auth/login` | Public | Authenticate, create session, return user info |
 | POST | `/api/v1/auth/logout` | Authenticated | Destroy session, invalidate cookie |
 | GET | `/api/v1/auth/me` | Authenticated | Return current user info (used by React on page load) |
+| POST | `/api/v1/auth/forgot-password` | Public | Accept email, send time-limited reset token via transactional email |
+| POST | `/api/v1/auth/reset-password` | Public | Accept token + new password, reset if token valid and email verified |
+| POST | `/api/v1/auth/verify-email` | Public | Accept verification token, set `email_verified = true` |
 
 ### Users
 | Method | Endpoint | Access | Description |
@@ -546,6 +569,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 |--------|----------|--------|-------------|
 | GET | `/api/v1/admin/posts/deleted` | ADMIN | List soft-deleted posts (filter disabled, shows is_deleted=true posts) |
 | PUT | `/api/v1/admin/posts/{id}/restore` | ADMIN | Restore a soft-deleted post (sets is_deleted=false) |
+| PUT | `/api/v1/admin/users/{id}/role` | ADMIN | Assign role to user (e.g., promote USER to AUTHOR) |
 
 ### Categories
 | Method | Endpoint | Access | Description |
@@ -578,7 +602,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 |--------|----------|--------|-------------|
 | GET | `/api/v1/notifications` | Authenticated | Get own notifications (paginated, newest first) |
 | PUT | `/api/v1/notifications/{id}/read` | Owner only | Mark a notification as read |
-| PUT | `/api/v1/notifications/read-all` | Authenticated | Mark all notifications as read |
+| PUT | `/api/v1/notifications/read-all` | Authenticated | Mark all unread notifications as read (scoped: `WHERE is_read = false`) |
 
 ### Images
 | Method | Endpoint | Access | Description |
@@ -635,7 +659,7 @@ All endpoints return a consistent JSON structure:
 
 | SQL Procedure | Java Service Method | Migration Details |
 |---|---|---|
-| `SP_Add_Comment` | `CommentService.addComment()` | 1. Check ReadPost exists for (user, post) → 403 if not. 2. Validate content ≤ 250 chars via `@Size`. 3. If parent_comment_id provided, verify parent exists and belongs to same post. 4. Save Comment entity. |
+| `SP_Add_Comment` | `CommentService.addComment()` | 1. Check ReadPost exists for (user, post) → 403 if not (opening the post page satisfies this — original SP behavior). 2. Validate content ≤ 250 chars via `@Size`. 3. If parent_comment_id provided, verify parent exists and belongs to same post. 4. Enforce max nesting depth of 3 levels: walk up parent chain, if depth exceeds 3, re-parent to the deepest allowed ancestor. 5. Save Comment entity. |
 | `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | ⚠️ **STUB in Phases 1–4** — returns 501. Future: Stripe webhook confirmation → set VIP flags server-side. No client-submitted payment data accepted. |
 | `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | Triggered asynchronously via `@TransactionalEventListener(phase = AFTER_COMMIT)` after PostService.createPost() commits. Runs in a background thread (`@Async`). Queries all active subscribers (expiration_date null or > now). Creates a Notification for each: "New post: {title} by {author}". Decoupled from the post creation transaction to prevent subscriber count from affecting post creation latency. |
 | `SP_Backup_All_DB` | Not migrated | Database backups handled by pg_dump cron job on the server (or AWS RDS automated backups in cloud phase). |
@@ -678,10 +702,10 @@ Each stored procedure's business rules must be covered by specific test cases to
 
 | SQL Stored Procedure | Java Equivalent | Business Rules to Validate | Test Cases |
 |---|---|---|---|
-| `SP_Add_Comment` | `CommentService.addComment()` | 1. Post must exist and not be deleted. 2. User must have read the post. 3. Comment text must not be empty. 4. Comment text ≤ 250 chars. 5. Parent comment must exist and belong to same post. | Unit: mock ReadPost lookup → reject if not read. Unit: content > 250 chars → validation error. Integration: full comment flow with threading. |
+| `SP_Add_Comment` | `CommentService.addComment()` | 1. Post must exist and not be deleted. 2. User must have read the post (opening the post page satisfies this). 3. Comment text must not be empty. 4. Comment text ≤ 250 chars. 5. Parent comment must exist and belong to same post. 6. Max nesting depth: 3 levels — deeper replies re-parented to deepest allowed ancestor. | Unit: mock ReadPost lookup → reject if not read. Unit: content > 250 chars → validation error. Unit: reply at depth 4 → re-parented to depth 3. Integration: full comment flow with threading. |
 | `SP_Upgrade_User_To_VIP` | `PaymentService.upgradeToVip()` | ⚠️ **STUB in Phases 1–4.** Returns 501. Full business rules deferred to Phase 5+ with Stripe integration. | Stub test: endpoint returns 501. Phase 5+: webhook sets VIP flags, duplicate webhook idempotency. |
 | `SP_Create_Post_Notifications` | `NotificationService.notifySubscribers()` | 1. Only active subscribers notified (expiration_date null or > now). 2. Expired subscribers skipped. 3. Notification message includes post title and author name. 4. Runs async — does not block post creation. 5. All notifications batch-inserted via single `saveAll()`. 6. Any exception caught, logged at ERROR level with post ID and subscriber count. Post ID logged to allow manual re-notification. | Unit: N active + M expired subscribers → N notifications created. Unit: batch failure → ERROR logged with post ID. Integration: create post → verify notifications exist after async processing. |
-| `SP_Backup_All_DB` / `SP_Backup_Database` | pg_dump cron job | Not migrated to Java. Validated by ops: verify pg_dump runs on schedule, backups are restorable. | Manual: restore from backup to a test database, verify data integrity. |
+| `SP_Backup_All_DB` / `SP_Backup_Database` | pg_dump cron job | Not migrated to Java. Validated by ops: verify pg_dump runs on schedule, backups are restorable. | Monthly automated verification: restore latest backup to temporary Docker PostgreSQL container, run integrity checks (row counts on key tables), destroy container. |
 
 ### Full-Text Search Strategy
 
@@ -794,6 +818,7 @@ SecurityFilterChain:
 - Development: allow `http://localhost:5173` (Vite dev server)
 - Production: allow only the actual domain
 - Credentials (cookies) allowed in cross-origin requests
+- `Access-Control-Max-Age: 3600` — caches preflight (OPTIONS) results for 1 hour, preventing duplicate preflight requests on every mutation
 
 ### Session Management
 
@@ -809,7 +834,7 @@ SecurityFilterChain:
 
 | Endpoint Pattern | Rule |
 |---|---|
-| `POST /api/v1/auth/**` | Public (permitAll) |
+| `POST /api/v1/auth/**` | Public (permitAll) — includes register, login, forgot-password, reset-password, verify-email |
 | `GET /api/v1/posts`, `GET /api/v1/posts/{id}` | Public |
 | `GET /api/v1/categories`, `GET /api/v1/tags` | Public |
 | `GET /api/v1/authors`, `GET /api/v1/authors/{id}` | Public |
@@ -820,12 +845,16 @@ SecurityFilterChain:
 | `PUT /api/v1/users/{id}` | Owner only |
 | Everything else | Authenticated |
 
+### Role Assignment
+
+- **USER** — default role on registration
+- **AUTHOR** — admin-assigned only via admin dashboard (`PUT /api/v1/admin/users/{id}/role`). Users cannot self-promote to AUTHOR.
+- **ADMIN** — admin-assigned only (initial admin created via seed data)
+
 ### Deferred Security Features (YAGNI)
 
 - 2FA — `two_factor_enabled` column kept in schema but not implemented
 - OAuth / social login — not needed for initial launch
-- Email verification — not needed for initial launch
-- Password reset flow — can be added later
 
 ---
 
@@ -931,7 +960,7 @@ Set up the project skeleton and core data layer.
 
 - Initialize Gradle project with Spring Boot 3.x, Java 21
 - Set up Docker Compose with PostgreSQL 16 and Redis 7
-- Configure Flyway and write migration scripts for all 17 tables (including `search_vector` tsvector column with GIN index)
+- Configure Flyway and write migration scripts for all 17 tables (including `search_vector` tsvector column with GIN index). Naming convention: `V1__initial_schema.sql` (all tables, indexes, constraints), `V2__seed_data.sql` (default categories, admin user), `R__search_vector_trigger.sql` (repeatable trigger for tsvector updates with Markdown stripping)
 - Implement JPA entities for all tables with relationships and validation
 - Configure Spring Security with session-based auth (Redis-backed sessions via Spring Session Data Redis)
 - Configure Bucket4j global rate limiting (tiered: anonymous 60/min, authenticated 120/min, auth 10/min)
@@ -948,15 +977,20 @@ Build out the full REST API.
 
 - Post CRUD with soft delete, pagination, filtering, full-text search
 - PostEntityListener for audit logging (PostUpdateLog)
-- Read tracking (mark posts as read on GET)
-- Comment system with threading and read-before-comment validation
+- Read tracking (mark posts as read on GET; "must read before commenting" rule — opening the post page satisfies this)
+- Comment system with threading, read-before-comment validation, 250-char limit, max nesting depth of 3 levels
 - Like/unlike functionality
 - Category and tag management
 - Saved posts / bookmarking
 - Author profiles with JSON social links
 - Subscription and async notification system (`@Async` + `@TransactionalEventListener(AFTER_COMMIT)`)
+- Notification retention: composite index on `(account_id, is_read, created_at)`, scheduled cleanup of read notifications older than 90 days, "mark all as read" scoped to `WHERE is_read = false`
+- ReadPost retention: scheduled cleanup of entries older than 1 year
+- Password reset: `POST /api/v1/auth/forgot-password` and `POST /api/v1/auth/reset-password` using time-limited single-use tokens via transactional email service (Mailgun, Postmark, or free-tier SendGrid)
+- Email verification: `POST /api/v1/auth/verify-email` using same email infrastructure. Required before password reset and VIP upgrade.
 - VIP upgrade endpoint (stub — returns 501; Stripe integration deferred to Phase 5+)
 - Image upload (local filesystem) with constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota
+- `@Size(max = 100000)` on blog post content field (~100 KB Markdown limit)
 - SpringDoc OpenAPI / Swagger documentation
 - Integration tests for all endpoints
 - Stored procedure validation checklist: verify all SP business rules covered by test cases
@@ -1162,6 +1196,8 @@ Restore: pg_restore from any backup file
 
 This extended retention protects against data corruption bugs that go unnoticed for more than a week. Storage cost is negligible (compressed PostgreSQL dumps for a small database are typically a few MB each).
 
+**Automated backup verification (monthly):** A cron job restores the latest backup to a temporary Docker PostgreSQL container, runs basic integrity checks (row counts on key tables), then destroys the container. This ensures backups are actually restorable — untested backups are nearly as risky as no backups.
+
 ### Firewall (UFW)
 
 Only three ports open to the internet:
@@ -1173,6 +1209,8 @@ Only three ports open to the internet:
 | 443 | TCP | HTTPS (all application traffic) |
 
 All other ports (8080 for Spring Boot, 5432 for PostgreSQL) are internal only — Docker containers communicate over an internal network that is not exposed to the internet.
+
+**SSH hardening:** Key-based authentication only, password authentication disabled (`PasswordAuthentication no` in `sshd_config`), fail2ban installed to block brute-force attempts.
 
 ### Monitoring
 
@@ -1354,7 +1392,6 @@ These exist in the original schema or README as future plans. They are deliberat
 - **Archiving old posts** — Listed in README future enhancements
 - **Gender in profiles** — Listed in README future enhancements
 - **OAuth / social login** — Not needed for initial launch
-- **Email verification** — Not needed for initial launch
-- **Password reset** — Can be added later
-- **Real-time notifications** — Polling is sufficient at this scale, WebSockets later if needed
+- **Account deletion / deactivation** — No self-service account deletion mechanism. Known gap — may be required for GDPR compliance if EU users are expected. Will require a policy for handling orphaned content (posts, comments) when implemented.
+- **Real-time notifications** — Polling is sufficient at this scale, WebSockets/SSE later if needed
 - **VIP payment processing** — The `POST /api/v1/users/{id}/upgrade-vip` endpoint is a stub (returns 501) in Phases 1–4. Phase 5+ will integrate Stripe Checkout: redirect to Stripe → receive webhook confirmation → set VIP flags server-side in the webhook handler. Client-submitted payment data (amount, transaction ID) must never be trusted without server-side verification against the payment processor.
