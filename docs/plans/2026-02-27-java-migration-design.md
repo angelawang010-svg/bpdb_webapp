@@ -1,6 +1,6 @@
 # BlogPlatformDB — Java Migration Design
 
-**Version:** 6.0
+**Version:** 7.0
 **Last Updated:** 2026-03-01
 **Status:** Approved
 
@@ -15,6 +15,7 @@
 | 3.0 | 2026-02-27 | Angela + Claude | Deployment strategy change | Replaced AWS as primary deployment target with VPS (self-hosted). Rationale: AWS is overkill for a few thousand users (~$50-80/month vs ~$6-12/month for a VPS). Added detailed VPS deployment section covering Docker, Nginx, SSL, backups, monitoring, and firewall. Demoted AWS to a future growth option (Phase 5 → optional). Updated implementation phases to reflect VPS as Phase 4 deployment target. Added Nginx architecture diagram and deployment commands. |
 | 4.0 | 2026-02-28 | Angela + Claude | Critical review response | Applied changes from critical design review (v1). **Critical fixes:** (1) Added greenfield deployment declaration — no SQL Server data migration needed, schema only. (2) Replaced in-memory sessions with Redis-backed sessions (Spring Session Data Redis); added Redis to Docker Compose stack. (3) Made subscriber notifications async via `@Async` + `@TransactionalEventListener(AFTER_COMMIT)` to eliminate post-creation bottleneck. (4) Added stored procedure validation checklist mapping each SP to Java equivalent and covering test cases. (5) Added global rate limiting with Bucket4j — tiered: anonymous 60 req/min, authenticated 120 req/min, auth endpoints 10 req/min. (6) Added image upload constraints: 5 MB max, JPEG/PNG/WebP only, filename sanitization, 100 MB per-user quota, disk alert at 70%. **Minor fixes:** (7) Documented `CookieCsrfTokenRepository.withHttpOnlyFalse()` requirement for CSRF. (8) Changed all API endpoints from `/api/` to `/api/v1/` for future versioning. (9) Specified PostgreSQL `tsvector/tsquery` with GIN indexes for full-text search. (10) Added 30-second notification polling interval with exponential backoff on error. (11) Documented Docker Compose single-point-of-failure as known limitation. (12) Extended backup retention: 7 daily + 4 weekly + 3 monthly. (13) Documented HikariCP connection pool defaults. (14) Added PaaS alternatives note for non-technical VPS operators. |
 | 6.0 | 2026-03-01 | Angela + Claude | Critical review response (v3) | Applied changes from critical design review (v3). All issues from reviews v1 and v2 were confirmed addressed in v5.0. This version resolves five critical issues, seven minor issues, and four clarification questions raised against v5.0. **Critical fixes:** (1) Moved password reset from Deferred to Phase 2 — baseline authentication requirement, not optional. Two new endpoints: `POST /api/v1/auth/forgot-password` and `POST /api/v1/auth/reset-password` using time-limited single-use tokens via transactional email service. (2) Added notification retention policy: composite index on `(account_id, is_read, created_at)`, auto-delete read notifications older than 90 days via scheduled cleanup job, scoped "mark all as read" to `WHERE is_read = false`. (3) Added `email_verified BOOLEAN DEFAULT false` column to UserAccount schema; email verification implemented in Phase 2 alongside password reset using same transactional email infrastructure. Enforced before password reset and VIP upgrade. (4) Capped comment nesting depth at 3 levels — `CommentService.addComment()` walks parent chain and re-parents if depth exceeds limit. (5) Documented ReadPost "must read before commenting" semantics: opening the post page satisfies the requirement (original SP behavior). Added 1-year retention policy for ReadPost entries. **Minor fixes:** (6) Added SSH hardening note: key-based auth only, password authentication disabled, fail2ban installed. (7) Added `Access-Control-Max-Age: 3600` to CORS configuration for preflight caching. (8) Documented UserProfile/UserAccount split rationale: separates auth data from display data, preserves original SQL Server schema design. (9) Added `@Size(max = 100000)` on blog post `content` field to prevent oversized submissions (~100 KB Markdown limit). (10) Clarified `Subscriber.expiration_date` semantics: always null in Phases 1–4 (free, permanent subscriptions); field exists for future Phase 5+ VIP-tied or time-limited scenarios. (11) Added monthly automated backup verification: restore latest backup to temporary Docker PostgreSQL container, run integrity checks, destroy container. (12) Documented Flyway migration naming convention: `V1__initial_schema.sql`, `V2__seed_data.sql`, `R__search_vector_trigger.sql`. **Clarification resolutions:** (13) AUTHOR role is admin-assigned only via admin dashboard. (14) Account deletion deferred — documented as known gap in Deferred Features. (15) 250-character comment limit confirmed as intentional business rule from original SQL Server SP. |
+| 7.0 | 2026-03-01 | Angela + Claude | Security audit response | Applied remediations from security audit (v1). Addresses 8 findings (1 High, 4 Medium, 3 Low). **High:** (1) IDOR — added Ownership Verification subsection specifying `OwnershipVerifier` service and `@PreAuthorize` pattern for all "Owner only" endpoints. **Medium:** (2) Image upload — added magic byte validation via Apache Tika and Nginx `X-Content-Type-Options: nosniff` on `/uploads/*`. (3) Password reset tokens — specified 32-byte cryptographically random tokens, 30-minute expiry, SHA-256 hashed storage, constant-time response to prevent user enumeration; same for email verification tokens. (4) Account lockout — added per-account failed login tracking in Redis: lock after 5 consecutive failures for 15 minutes, reset on success. (5) Redis authentication — added `requirepass` configuration in Docker Compose. **Low:** (6) Credential management — documented `.env`/`.env.example` gitignore rules, placeholder-only example, 24-char minimum DB password, full secrets inventory. (7) Actuator — restricted to health endpoint only via `management.endpoints.web.exposure.include=health` + Nginx block. (8) Notifications — explicitly stated controller must extract `account_id` from security context, never from request parameters. |
 | 5.0 | 2026-02-28 | Angela + Claude | Critical review response (v2) | Applied changes from critical design review (v2). All six issues from review v1 were confirmed addressed in v4.0. This version resolves five new critical issues and seven minor issues raised against v4.0. **Critical fixes:** (1) Deferred VIP payment processing — `POST /api/v1/users/{id}/upgrade-vip` endpoint and the `payment/` package are now explicitly marked as stubs; no real payment gateway is wired in Phases 1–4. VIP payments moved to Deferred Features with a Stripe Checkout note for Phase 5+. Eliminates the security risk of accepting client-submitted, server-unverified payment data. (2) Specified Markdown as the blog post content format — raw Markdown stored in `content TEXT` column, rendered to sanitized HTML on the front-end via `react-markdown` + `rehype-sanitize`; Markdown syntax stripped before `tsvector` indexing via Flyway trigger. Added Content Format section. (3) Kept Redis session storage (review recommended JDBC for single-VPS simplicity; overruled — Redis is already configured, operational cost is acceptable, and it simplifies the future AWS ElastiCache migration to a connection-string swap). (4) Added full XSS prevention strategy: `rehype-sanitize` for rendered Markdown, Nginx `Content-Security-Policy: script-src 'self'` header, back-end rejection of any HTML in comment text, prohibition on raw `dangerouslySetInnerHTML`. Replaced the vague "input sanitization" Phase 4 bullet with a detailed XSS Prevention section. (5) Added error handling and observability to `@Async` notifications: try-catch with ERROR-level logging (post ID, subscriber count, error), batch `saveAll()` replacing N individual inserts, failure logging by post ID for manual re-notification. **Minor fixes:** (6) Replaced `@Where(clause = "is_deleted = false")` on `BlogPost` with Hibernate `@FilterDef` / `@Filter` to support admin view and restore of soft-deleted posts; added `GET /api/v1/admin/posts/deleted` endpoint to admin section. (7) Added Vite proxy configuration to route `/api` requests to `localhost:8080` during development, eliminating cross-origin session cookie issues without requiring `SameSite=None`. (8) Specified Slack incoming webhook as the alert destination for monitoring cron jobs (disk usage, backup failures). (9) Fixed `@PreUpdate` audit logging: service layer loads the existing post before applying changes, passes captured old values to `PostUpdateLog` — replacing the broken entity listener approach where `@PreUpdate` receives the already-modified entity. (10) Added server-side maximum page size of 100 and documented defaults (page=0, size=20) via `PageableHandlerMethodArgumentResolver`. (11) Removed the incorrect "zero-downtime with `--no-deps`" claim from the deployment commands section; the Known Limitations section already correctly documents the brief restart downtime. (12) Added explicit log level configuration to `application-prod.yml`: `root=WARN`, `com.blogplatform=INFO`, `org.hibernate.SQL=WARN` to prevent Hibernate SQL flooding of production logs. |
 
 ---
@@ -201,10 +202,13 @@ backend/src/main/java/com/blogplatform/
 │   │                                   POST /api/v1/auth/verify-email
 │   ├── AuthService.java              Registration, password hashing, session creation,
 │   │                                   password reset tokens, email verification tokens
-│   ├── PasswordResetToken.java       Entity: token (unique), account_id FK, expires_at,
-│   │                                   used (boolean). Single-use, time-limited.
-│   ├── EmailVerificationToken.java   Entity: token (unique), account_id FK, expires_at,
-│   │                                   used (boolean). Single-use, time-limited.
+│   ├── PasswordResetToken.java       Entity: token_hash (unique, SHA-256), account_id FK,
+│   │                                   expires_at, used (boolean). Single-use, 30-minute expiry.
+│   │                                   Token: 32 bytes cryptographically random, URL-safe base64.
+│   │                                   Stored as SHA-256 hash; plaintext sent to user via email only.
+│   ├── EmailVerificationToken.java   Entity: token_hash (unique, SHA-256), account_id FK,
+│   │                                   expires_at, used (boolean). Single-use, 30-minute expiry.
+│   │                                   Same token spec as PasswordResetToken.
 │   └── dto/
 │       ├── RegisterRequest.java      username, email, password (validated)
 │       ├── LoginRequest.java         username, password
@@ -521,7 +525,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 | POST | `/api/v1/auth/login` | Public | Authenticate, create session, return user info |
 | POST | `/api/v1/auth/logout` | Authenticated | Destroy session, invalidate cookie |
 | GET | `/api/v1/auth/me` | Authenticated | Return current user info (used by React on page load) |
-| POST | `/api/v1/auth/forgot-password` | Public | Accept email, send time-limited reset token via transactional email |
+| POST | `/api/v1/auth/forgot-password` | Public | Accept email, send time-limited reset token via transactional email. Always returns the same 200 response ("If an account exists, a reset email was sent") regardless of whether the email exists — prevents user enumeration |
 | POST | `/api/v1/auth/reset-password` | Public | Accept token + new password, reset if token valid and email verified |
 | POST | `/api/v1/auth/verify-email` | Public | Accept verification token, set `email_verified = true` |
 
@@ -600,7 +604,7 @@ Comment ──N:1──> Comment (parent, self-referencing for threading)
 ### Notifications
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | `/api/v1/notifications` | Authenticated | Get own notifications (paginated, newest first) |
+| GET | `/api/v1/notifications` | Authenticated | Get own notifications (paginated, newest first). Controller extracts `account_id` from security context and passes to repository — never accepts `account_id` as a request parameter |
 | PUT | `/api/v1/notifications/{id}/read` | Owner only | Mark a notification as read |
 | PUT | `/api/v1/notifications/read-all` | Authenticated | Mark all unread notifications as read (scoped: `WHERE is_read = false`) |
 
@@ -723,7 +727,7 @@ Full-text search on `GET /api/v1/posts?search=` uses PostgreSQL's native full-te
 | Constraint | Value | Implementation |
 |---|---|---|
 | Maximum file size | 5 MB | `spring.servlet.multipart.max-file-size=5MB` in application.yml |
-| Allowed MIME types | JPEG, PNG, WebP | Validated in `ImageService` before saving — reject others with 400 |
+| Allowed MIME types | JPEG, PNG, WebP | Validated in `ImageService` before saving — reject others with 400. Validation checks both `Content-Type` header and file magic bytes (file signature) using Apache Tika to prevent content-type spoofing and polyglot file attacks |
 | Filename sanitization | Strip path separators, special chars, use UUID-based filenames | `ImageService` generates `{uuid}.{ext}` to prevent path traversal |
 | Per-user storage quota | 100 MB | `ImageService` tracks cumulative upload size per user, rejects when exceeded |
 | Disk usage alert | 70% threshold | Cron job or health check alerts when VPS disk usage exceeds 70% |
@@ -741,6 +745,12 @@ Global rate limiting using Bucket4j, applied via a servlet filter in the Spring 
 - Bucket4j integrates with Spring Boot and supports in-memory token buckets
 - Rate limit headers (`X-Rate-Limit-Remaining`, `Retry-After`) included in responses
 - Exceeded limits return `429 Too Many Requests`
+
+**Per-account login lockout** (defense-in-depth against distributed brute force):
+- Track consecutive failed login attempts per username in Redis (key: `login:failures:{username}`, TTL: 15 minutes)
+- After 5 consecutive failures, lock the account for 15 minutes — return `423 Locked` with a message indicating temporary lockout
+- Reset the failure counter on successful login
+- Log all failed login attempts with username and IP address for anomaly detection
 
 ### Connection Pool Configuration
 
@@ -824,6 +834,7 @@ SecurityFilterChain:
 
 - Sessions stored in **Redis** via Spring Session Data Redis
 - Redis runs as a Docker container alongside the application (included in Docker Compose)
+- Redis configured with `requirepass` — password stored in `.env`, referenced via `spring.data.redis.password` in `application.yml`
 - Session timeout: 30 minutes of inactivity
 - Session fixation protection: create new session on login
 - Single session per user (optional, can be relaxed)
@@ -844,6 +855,24 @@ SecurityFilterChain:
 | `POST/DELETE /api/v1/categories`, `/api/v1/tags` | `hasRole('ADMIN')` |
 | `PUT /api/v1/users/{id}` | Owner only |
 | Everything else | Authenticated |
+
+### Ownership Verification (IDOR Prevention)
+
+All endpoints marked "Owner only" or "Owner, ADMIN" must verify that the authenticated user owns the target resource. This is enforced via a shared `OwnershipVerifier` service to prevent per-endpoint inconsistencies.
+
+**Pattern:**
+- `OwnershipVerifier.verify(resourceOwnerId, authentication)` — throws `AccessDeniedException` if the authenticated user's `account_id` does not match the resource owner and the user does not have `ROLE_ADMIN`
+- Controllers extract the current user's `account_id` from `SecurityContextHolder.getContext().getAuthentication()` — never from request parameters or path variables
+- Use `@PreAuthorize("@ownershipVerifier.isOwnerOrAdmin(#id, authentication)")` on controller methods where possible
+
+**Affected endpoints:**
+- `PUT /api/v1/users/{id}` — compare `{id}` against authenticated user's `account_id`
+- `GET /api/v1/users/{id}/saved-posts` — compare `{id}` against authenticated user's `account_id`
+- `POST /api/v1/users/{id}/upgrade-vip` — compare `{id}` against authenticated user's `account_id`
+- `PUT/DELETE /api/v1/posts/{id}` — load post, compare `post.account_id` against authenticated user
+- `DELETE /api/v1/comments/{id}` — load comment, compare `comment.account_id` against authenticated user
+- `DELETE /api/v1/images/{id}` — load image, compare `image.account_id` against authenticated user
+- `PUT /api/v1/notifications/{id}/read` — load notification, compare `notification.account_id` against authenticated user
 
 ### Role Assignment
 
@@ -1028,7 +1057,7 @@ Deploy to a VPS and prepare for real users. See Section 10 for full deployment d
 - HTTPS via Let's Encrypt / Certbot
 - UFW firewall configuration (allow only ports 80, 443, 22)
 - Logging configuration (structured JSON logs, log rotation)
-- Health check endpoint (`/actuator/health`)
+- Health check endpoint (`/actuator/health`) — only exposed Actuator endpoint (`management.endpoints.web.exposure.include=health` in `application-prod.yml`)
 - Database backup script (pg_dump cron job: 7 daily + 4 weekly + 3 monthly retention)
 - Global rate limiting already configured in Phase 1 (Bucket4j)
 - XSS prevention (see XSS Prevention section below)
@@ -1078,7 +1107,8 @@ VPS (~$6-12/month)
 │  │  │                                           │   │  │
 │  │  │  :8080 (internal only, not exposed)       │   │  │
 │  │  │  REST API, business logic, auth           │   │  │
-│  │  │  Health check: /actuator/health           │   │  │
+│  │  │  Health check: /actuator/health (only      │   │  │
+│  │  │    exposed endpoint; all others disabled)  │   │  │
 │  │  └──────────────────┬───────────────────────┘   │  │
 │  │                     │                            │  │
 │  │  ┌──────────────────┴───────────────────────┐   │  │
@@ -1094,6 +1124,7 @@ VPS (~$6-12/month)
 │  │  │                                           │   │  │
 │  │  │  :6379 (internal only, not exposed)       │   │  │
 │  │  │  Session storage (Spring Session)         │   │  │
+│  │  │  requirepass enabled (password in .env)   │   │  │
 │  │  │  ~50 MB RAM footprint                     │   │  │
 │  │  └──────────────────────────────────────────┘   │  │
 │  │                                                 │  │
@@ -1144,7 +1175,7 @@ cd blog-platform
 
 # 4. Create .env file with production secrets
 cp .env.example .env
-nano .env  # Set DB password, session secret, domain name
+nano .env  # Set all required secrets (see below)
 
 # 5. Obtain SSL certificate
 certbot certonly --standalone -d yourdomain.com
@@ -1152,6 +1183,16 @@ certbot certonly --standalone -d yourdomain.com
 # 6. Start everything
 docker compose -f docker-compose.prod.yml up -d
 ```
+
+**Environment secrets management:**
+- `.env` must be in `.gitignore` — never committed to the repository
+- `.env.example` is committed with placeholder values only (e.g., `DB_PASSWORD=changeme`) — never real credentials
+- Required secrets in `.env`:
+  - `DB_PASSWORD` — randomly generated, minimum 24 characters
+  - `REDIS_PASSWORD` — randomly generated, minimum 24 characters
+  - `SESSION_SECRET` — randomly generated, minimum 32 characters
+  - `DOMAIN_NAME` — the production domain
+  - `EMAIL_API_KEY` — transactional email service API key (Mailgun, Postmark, or SendGrid)
 
 **Updating the app (on each deploy):**
 
@@ -1176,7 +1217,9 @@ Nginx serves as the single entry point. Key responsibilities:
 | API reverse proxy | Forwards `/api/v1/*` requests to Spring Boot at `http://backend:8080` |
 | Static file caching | Sets `Cache-Control` headers for CSS/JS/images (long cache, fingerprinted) |
 | Gzip compression | Compresses text responses for faster page loads |
-| Security headers | `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Content-Security-Policy: script-src 'self'` (blocks inline script execution) |
+| Security headers | `X-Frame-Options`, `X-Content-Type-Options: nosniff`, `Strict-Transport-Security`, `Content-Security-Policy: script-src 'self'` (blocks inline script execution). `X-Content-Type-Options: nosniff` also set explicitly on the `/uploads/*` location block to prevent MIME-type sniffing of uploaded files |
+| Upload content type | Serve `/uploads/*` with the validated image MIME type only (set by Spring Boot during upload validation). Add `Content-Disposition: inline` only for confirmed image types |
+| Actuator blocking | Block all `/actuator/*` requests except `/actuator/health` — returns 404 for `/actuator/env`, `/actuator/beans`, etc. Defense-in-depth alongside `management.endpoints.web.exposure.include=health` in `application-prod.yml` |
 | Client-side routing | Returns `index.html` for all non-API, non-file routes (React Router handles routing) |
 
 ### Database Backups
