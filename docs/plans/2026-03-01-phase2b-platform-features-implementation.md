@@ -12,9 +12,7 @@
 
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — Sections 5 (API Endpoints), 6 (Business Logic Migration), and 8 (Testing Strategy).
 
-**Prerequisite:** Phase 1 must be complete (all 15 tasks).
-
-**Prerequisite: Phase 2A (Tasks 1-10) must be complete.**
+**Prerequisite:** Phase 2A (Tasks 1-10) must be complete.
 
 ## Phase 2 Parts
 
