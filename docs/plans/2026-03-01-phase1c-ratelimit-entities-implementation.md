@@ -27,6 +27,7 @@
 | 1.0 | 2026-03-01 | Initial plan |
 | 1.1 | 2026-03-03 | Critical review fixes: Task 11 rewritten (Caffeine cache, IP spoofing fix, double-filter fix, URL pattern fix, accurate Retry-After, added tests), Task 12 null safety + principal type alignment, Task 13 full entity code for all 16 files, Task 15 git add fix. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-1.md` for review details. |
 | 1.2 | 2026-03-03 | Critical review v2 fixes: Removed RateLimitConfig (use @Order on filter), fixed anonymous user check to use auth.getName(), removed redundant UniqueConstraint from SavedPost, added @PrePersist to PostUpdateLog, added equals()/hashCode() to all 11 entities, fixed AuthFlowIT to pass invalidated session, added staging comment to Task 15. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-2.md`. |
+| 1.3 | 2026-03-03 | Security audit fixes: Added validation reminder comment to AuthorProfile.socialLinks (real validation deferred to Phase 2 DTO layer), added @Pattern to Image.imageUrl restricting to /uploads/ paths, added @Size(max=1000) to Notification.message, added equals()/hashCode() to ReadPost and SavedPost entities. See `2026-03-03-phase1c-ratelimit-entities-implementation-security-audit-1.md`. |
 
 ---
 
@@ -760,6 +761,7 @@ package com.blogplatform.post;
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
+import java.util.Objects;
 
 @Entity
 @Table(name = "read_posts")
@@ -787,6 +789,22 @@ public class ReadPost {
     public void setPost(BlogPost post) { this.post = post; }
     public LocalDateTime getReadAt() { return readAt; }
     public void setReadAt(LocalDateTime readAt) { this.readAt = readAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ReadPost that)) return false;
+        return account != null && post != null
+                && Objects.equals(account.getId(), that.account != null ? that.account.getId() : null)
+                && Objects.equals(post.getId(), that.post != null ? that.post.getId() : null);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+                account != null ? account.getId() : null,
+                post != null ? post.getId() : null);
+    }
 }
 ```
 
@@ -835,6 +853,7 @@ package com.blogplatform.post;
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
+import java.util.Objects;
 
 @Entity
 @Table(name = "saved_posts")
@@ -862,6 +881,22 @@ public class SavedPost {
     public void setPost(BlogPost post) { this.post = post; }
     public LocalDateTime getSavedAt() { return savedAt; }
     public void setSavedAt(LocalDateTime savedAt) { this.savedAt = savedAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof SavedPost that)) return false;
+        return account != null && post != null
+                && Objects.equals(account.getId(), that.account != null ? that.account.getId() : null)
+                && Objects.equals(post.getId(), that.post != null ? that.post.getId() : null);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+                account != null ? account.getId() : null,
+                post != null ? post.getId() : null);
+    }
 }
 ```
 
@@ -1027,6 +1062,10 @@ public class AuthorProfile {
     @Column(name = "biography")
     private String biography;
 
+    // SECURITY: When the author profile update endpoint is built (Phase 2),
+    // the DTO/controller MUST validate: map size ≤ 10, keys from allowlist
+    // (twitter, github, linkedin, website), values match ^https?://.*
+    // to prevent stored XSS via javascript: or data: URI schemes.
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "social_links", columnDefinition = "jsonb")
     private Map<String, String> socialLinks;
@@ -1222,6 +1261,7 @@ package com.blogplatform.notification;
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import java.time.LocalDateTime;
 
 @Entity
@@ -1241,6 +1281,7 @@ public class Notification {
     private UserAccount account;
 
     @NotBlank
+    @Size(max = 1000)
     @Column(name = "message", nullable = false, columnDefinition = "TEXT")
     private String message;
 
@@ -1287,6 +1328,7 @@ package com.blogplatform.image;
 
 import com.blogplatform.post.BlogPost;
 import jakarta.persistence.*;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import java.time.LocalDateTime;
 
@@ -1304,6 +1346,7 @@ public class Image {
     private BlogPost post;
 
     @Size(max = 255)
+    @Pattern(regexp = "^/uploads/.*", message = "Image URL must be a server upload path")
     @Column(name = "image_url", unique = true)
     private String imageUrl;
 
