@@ -12,7 +12,7 @@
 
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — the authoritative source for all schema, API, security, and business logic decisions.
 
-**Version:** 1.2 — Updated 2026-03-03 per critical review v2 (`2026-03-01-phase1b-auth-security-implementation-critical-review-2.md`). All validated findings applied: unified auth path (2.1/2.2), lazy loading fix (2.3), 423 lockout status (2.4), atomic Redis ops (2.5), IP logging (3.1), lockout integration test (3.7), generic exception message (3.8).
+**Version:** 1.2 (2026-03-03) — See [Changelog](#changelog) for full history.
 
 ## Phase 1 Parts
 
@@ -1265,6 +1265,59 @@ Expected: All 6 tests PASS (including lockout integration test returning 423).
 git add backend/src/main/java/com/blogplatform/auth/ backend/src/main/java/com/blogplatform/common/exception/AccountLockedException.java backend/src/test/java/com/blogplatform/auth/
 git commit -m "feat: add AuthController with register, login (unified auth path), logout, /me, lockout (423)"
 ```
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v1.0 | 2026-03-01 | Initial plan — Tasks 6-11 covering entities, Spring Security, DTOs, AuthService, AuthController |
+| v1.1 | 2026-03-03 | Applied critical review v1 fixes (15 findings) |
+| v1.2 | 2026-03-03 | Applied critical review v2 fixes (5 critical, 3 minor validated) |
+
+### v1.1 Changes (Critical Review 1)
+
+**Critical fixes:**
+1. Added `LoginAttemptService` with Redis-backed brute-force protection (was missing entirely)
+2. Added `.with(csrf())` to all POST requests in `AuthControllerTest`
+3. Added `AuthenticationManager` bean and `CustomUserDetailsService` — login goes through Spring Security pipeline (was manual `SecurityContext` manipulation)
+4. Added `max = 128` to password `@Size` annotation (BCrypt DoS prevention)
+5. Changed `createdAt` to use `@PrePersist` callback (was field initializer)
+6. Used `ObjectMapper` for error JSON in `SecurityConfig` (was string concatenation)
+
+**Minor fixes:**
+7. Added `@Pattern` on username (`^[a-zA-Z0-9_-]+$`)
+8. Email normalization to lowercase before save and lookup
+9. Login count / last login tracking in login flow
+10. CORS origins externalized to `application.yml`
+11. `findById` promoted to proper step in Task 10
+12. Consistent `@Column(name = "...")` on all entity fields
+13. `SpringSessionBackedSessionRegistry` bean for concurrent session control
+14. Added duplicate registration test
+15. Timing side-channel mitigation — dummy hash on user-not-found
+
+**Review reference:** `docs/plans/2026-03-01-phase1b-auth-security-implementation-critical-review-1.md`
+
+### v1.2 Changes (Critical Review 2)
+
+**Critical fixes:**
+1. **Unified auth path** (review 2.1/2.2) — eliminated double BCrypt verification. `AuthenticationManager` is sole credential verifier; `AuthService` handles lockout pre-check only. Removed invalid `DUMMY_HASH` (Spring's `DaoAuthenticationProvider` handles timing protection natively via `hideUserNotFoundExceptions`)
+2. **Fixed LazyInitializationException** (review 2.3) — moved login tracking to `AuthService.recordLoginSuccess()` with `@Transactional`, safely loading lazy `UserProfile`. Controller no longer injects `UserRepository` directly
+3. **423 lockout status** (review 2.4) — new `AccountLockedException` mapped to HTTP 423 in `GlobalExceptionHandler` (was `BadRequestException`/400, contradicting design doc)
+4. **Atomic Redis ops** (review 2.5) — `LoginAttemptService.recordFailure()` uses Lua script for atomic `INCR` + `EXPIRE` (prevents permanent lockout on crash between two commands)
+
+**Minor fixes:**
+5. **IP address in failure logs** (review 3.1) — `recordFailure()` now takes `ipAddress` param, logged alongside username per design doc requirement
+6. **Lockout integration test** (review 3.7) — added `login_withLockedAccount_returns423()` that fails 5 times then verifies 423 on 6th attempt
+7. **Generic exception message** (review 3.8) — `CustomUserDetailsService` throws `"Bad credentials"` instead of `"User not found: " + username`
+
+**Invalidated issues from review:**
+- 3.2 (Missing migrations) — validated that Phase 1A Task 4 defines them; added a note to Task 6
+- 3.5 (`ApiResponse` overloads) — both one-arg and two-arg `success()` exist in Phase 1A
+- 3.6 (Test isolation) — low risk; unique usernames per test, fresh containers per class
+
+**Review reference:** `docs/plans/2026-03-01-phase1b-auth-security-implementation-critical-review-2.md`
 
 ---
 
