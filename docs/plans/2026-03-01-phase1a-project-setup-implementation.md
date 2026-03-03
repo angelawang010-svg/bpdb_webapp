@@ -247,7 +247,7 @@ services:
       POSTGRES_USER: blogplatform
       POSTGRES_PASSWORD: ${DB_PASSWORD:-blogplatform}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -260,7 +260,7 @@ services:
     image: redis:7
     command: redis-server --requirepass ${REDIS_PASSWORD:-devredispassword}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD-SHELL", "REDISCLI_AUTH=${REDIS_PASSWORD:-devredispassword} redis-cli ping"]
       interval: 10s
@@ -515,6 +515,7 @@ git commit -m "feat: add Flyway V1 migration with all 17 tables"
 **Files:**
 - Create: `backend/src/main/resources/db/migration/V2__seed_data.sql`
 - Create: `backend/src/main/resources/db/migration/R__search_vector_trigger.sql`
+- Create: `backend/src/main/java/com/blogplatform/config/DevDataSeeder.java`
 
 **Step 1: Write seed data migration**
 
@@ -527,17 +528,58 @@ INSERT INTO category (category_name, description) VALUES
     ('Lifestyle', 'Health, wellness, and daily living'),
     ('Travel', 'Destinations, tips, and travel stories'),
     ('Food', 'Recipes, reviews, and culinary adventures');
+```
 
--- Dev-only admin user (BCrypt hash with work factor 12)
--- IMPORTANT: Production deployments must create admin accounts through a secure process.
--- Do NOT rely on this seed data in production.
-INSERT INTO user_account (username, email, password_hash, role, email_verified)
-VALUES ('admin', 'admin@blogplatform.com',
-        '$2a$12$LJ3m4ys3uz0b/tMkgqHUZeJ0SJyKfxBVOKFqW8GbMFmJN7gmPVqtG',
-        'ADMIN', TRUE);
+> **Note:** The admin seed user has been moved out of this versioned migration. See the `DevDataSeeder` below, which only runs under the `dev` profile.
 
-INSERT INTO user_profile (account_id, first_name, last_name)
-SELECT account_id, 'System', 'Admin' FROM user_account WHERE username = 'admin';
+Create `backend/src/main/java/com/blogplatform/config/DevDataSeeder.java`:
+```java
+package com.blogplatform.config;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.context.annotation.Profile;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+
+@Component
+@Profile("dev")
+public class DevDataSeeder implements CommandLineRunner {
+
+    private static final Logger log = LoggerFactory.getLogger(DevDataSeeder.class);
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public DevDataSeeder(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    @Override
+    public void run(String... args) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM user_account WHERE username = 'admin'", Integer.class);
+        if (count != null && count > 0) {
+            log.info("Dev admin user already exists, skipping seed");
+            return;
+        }
+
+        // BCrypt hash with work factor 12 — dev-only, never use in production
+        jdbcTemplate.update("""
+                INSERT INTO user_account (username, email, password_hash, role, email_verified)
+                VALUES ('admin', 'admin@blogplatform.com',
+                        '$2a$12$LJ3m4ys3uz0b/tMkgqHUZeJ0SJyKfxBVOKFqW8GbMFmJN7gmPVqtG',
+                        'ADMIN', TRUE)
+                """);
+
+        jdbcTemplate.update("""
+                INSERT INTO user_profile (account_id, first_name, last_name)
+                SELECT account_id, 'System', 'Admin' FROM user_account WHERE username = 'admin'
+                """);
+
+        log.info("Dev admin user seeded successfully");
+    }
+}
 ```
 
 **Step 2: Write repeatable search vector trigger migration**
@@ -591,8 +633,8 @@ Expected: Flyway logs show V2 and R__search_vector_trigger applied. Stop the app
 **Step 4: Commit**
 
 ```bash
-git add backend/src/main/resources/db/migration/
-git commit -m "feat: add seed data and search vector trigger migrations"
+git add backend/src/main/resources/db/migration/ backend/src/main/java/com/blogplatform/config/DevDataSeeder.java
+git commit -m "feat: add seed data, search vector trigger, and dev admin seeder"
 ```
 
 ---
@@ -721,6 +763,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -750,6 +794,17 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
         return ResponseEntity.status(HttpStatus.FORBIDDEN)
                 .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    // Re-throw Spring Security exceptions so ExceptionTranslationFilter handles them
+    @ExceptionHandler(AccessDeniedException.class)
+    public void handleAccessDenied(AccessDeniedException ex) throws AccessDeniedException {
+        throw ex;
+    }
+
+    @ExceptionHandler(AuthenticationException.class)
+    public void handleAuthenticationException(AuthenticationException ex) throws AuthenticationException {
+        throw ex;
     }
 
     @ExceptionHandler(BadRequestException.class)
@@ -897,6 +952,7 @@ git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEnti
 | v1.0 | 2026-03-01 | Initial plan |
 | v1.1 | 2026-03-03 | Applied critical review 1 fixes (see below) |
 | v1.2 | 2026-03-03 | Applied critical review 2 fixes (see below) |
+| v1.3 | 2026-03-03 | Applied security audit fixes (see below) |
 
 ### v1.1 Changes (Critical Review 1)
 
@@ -936,3 +992,19 @@ git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEnti
 - M5 — `ApiResponse.error()` generic type is fine as-is
 
 **Review reference:** `docs/plans/2026-03-01-phase1a-project-setup-implementation-critical-review-2.md`
+
+### v1.3 Changes (Security Audit)
+
+**Fixes applied:**
+- **S2 — Admin seed in versioned migration (High):** Removed admin user INSERT from `V2__seed_data.sql`. Created `DevDataSeeder` (`@Profile("dev")` `CommandLineRunner`) that seeds the admin user only in dev environments, with idempotency check. (Task 4)
+- **S3 — Docker ports bound to 0.0.0.0 (Medium):** Changed port mappings to `127.0.0.1:5432:5432` and `127.0.0.1:6379:6379` to bind to localhost only. (Task 2)
+- **S6 — Catch-all suppresses security exceptions (Medium):** Added explicit `@ExceptionHandler` methods for `AccessDeniedException` and `AuthenticationException` that re-throw to let Spring Security's `ExceptionTranslationFilter` handle them. (Task 5)
+
+**Deferred (out of scope for Phase 1A):**
+- S1 — Hardcoded dev credentials: Accepted as Low risk; prod profile already uses env vars without defaults (v1.2 M3).
+- S4 — Missing `updated_at` on `user_account`: Scope expansion, track for future phase.
+- S5 — No soft-delete filtering at DB level: Address with `@SQLRestriction` when implementing BlogPost entity.
+- S7 — Payment amount upper bound: Address when implementing payment business logic.
+- S8 — Comment content XSS: Informational; address with output encoding in API layer.
+
+**Review reference:** `docs/plans/2026-03-03-phase1a-project-setup-implementation-security-audit-1.md`
