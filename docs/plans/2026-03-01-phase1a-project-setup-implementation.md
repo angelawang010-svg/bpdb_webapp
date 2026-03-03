@@ -78,6 +78,7 @@ dependencies {
 
     // Rate limiting
     implementation 'com.bucket4j:bucket4j-core:8.10.1'
+    implementation 'com.github.ben-manes.caffeine:caffeine'
 
     // OpenAPI / Swagger
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.5'
@@ -953,6 +954,7 @@ git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEnti
 | v1.1 | 2026-03-03 | Applied critical review 1 fixes (see below) |
 | v1.2 | 2026-03-03 | Applied critical review 2 fixes (see below) |
 | v1.3 | 2026-03-03 | Applied security audit fixes (see below) |
+| v1.4 | 2026-03-03 | Pre-implementation review: added missing Caffeine dependency to build.gradle |
 
 ### v1.1 Changes (Critical Review 1)
 

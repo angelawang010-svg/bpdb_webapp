@@ -28,6 +28,7 @@
 | 1.1 | 2026-03-03 | Critical review fixes: Task 11 rewritten (Caffeine cache, IP spoofing fix, double-filter fix, URL pattern fix, accurate Retry-After, added tests), Task 12 null safety + principal type alignment, Task 13 full entity code for all 16 files, Task 15 git add fix. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-1.md` for review details. |
 | 1.2 | 2026-03-03 | Critical review v2 fixes: Removed RateLimitConfig (use @Order on filter), fixed anonymous user check to use auth.getName(), removed redundant UniqueConstraint from SavedPost, added @PrePersist to PostUpdateLog, added equals()/hashCode() to all 11 entities, fixed AuthFlowIT to pass invalidated session, added staging comment to Task 15. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-2.md`. |
 | 1.3 | 2026-03-03 | Security audit fixes: Added validation reminder comment to AuthorProfile.socialLinks (real validation deferred to Phase 2 DTO layer), added @Pattern to Image.imageUrl restricting to /uploads/ paths, added @Size(max=1000) to Notification.message, added equals()/hashCode() to ReadPost and SavedPost entities. See `2026-03-03-phase1c-ratelimit-entities-implementation-security-audit-1.md`. |
+| 1.4 | 2026-03-03 | Pre-implementation review: Fixed 8 @Table names to match migration (plural→singular), fixed 3 @Column name mismatches (post_title→title, post_content→content, comment_text→content), removed non-existent columns (Subscriber.is_active, Payment.paymentDescription), fixed Subscriber/Payment column name mismatches, changed all LocalDateTime→Instant for TIMESTAMPTZ columns, fixed BlogPost.category nullable, AuthorProfile.expertise nullable, Image.imageUrl nullable+length, Category.categoryName @Size 50→100, Payment.paymentMethod length 50→20, Payment.transactionId length 50→255, OwnershipVerifier changed from String username to Long accountId (aligned with CustomUserDetailsService principal), added CSRF to AuthFlowIT POSTs, AuthFlowIT now uses Redis container instead of store-type=none, fixed ReadPost/SavedPost equals() to use getAccountId(). |
 
 ---
 
@@ -318,41 +319,42 @@ class OwnershipVerifierTest {
 
     @Test
     void isOwnerOrAdmin_whenOwner_returnsTrue() {
+        // Principal name is accountId (stored as String by CustomUserDetailsService)
         Authentication auth = new UsernamePasswordAuthenticationToken(
-                "owneruser", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
-        assertThat(verifier.isOwnerOrAdmin("owneruser", auth)).isTrue();
+                "42", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
+        assertThat(verifier.isOwnerOrAdmin(42L, auth)).isTrue();
     }
 
     @Test
     void isOwnerOrAdmin_whenAdmin_returnsTrue() {
         Authentication auth = new UsernamePasswordAuthenticationToken(
-                "adminuser", null, List.of(new SimpleGrantedAuthority("ROLE_ADMIN")));
-        assertThat(verifier.isOwnerOrAdmin("otheruser", auth)).isTrue();
+                "99", null, List.of(new SimpleGrantedAuthority("ROLE_ADMIN")));
+        assertThat(verifier.isOwnerOrAdmin(42L, auth)).isTrue();
     }
 
     @Test
     void isOwnerOrAdmin_whenNeitherOwnerNorAdmin_returnsFalse() {
         Authentication auth = new UsernamePasswordAuthenticationToken(
-                "otheruser", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
-        assertThat(verifier.isOwnerOrAdmin("owneruser", auth)).isFalse();
+                "99", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
+        assertThat(verifier.isOwnerOrAdmin(42L, auth)).isFalse();
     }
 
     @Test
     void verify_whenNotOwnerOrAdmin_throwsAccessDenied() {
         Authentication auth = new UsernamePasswordAuthenticationToken(
-                "otheruser", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
-        assertThatThrownBy(() -> verifier.verify("owneruser", auth))
+                "99", null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
+        assertThatThrownBy(() -> verifier.verify(42L, auth))
                 .isInstanceOf(AccessDeniedException.class);
     }
 
     @Test
     void isOwnerOrAdmin_nullAuthentication_returnsFalse() {
-        assertThat(verifier.isOwnerOrAdmin("owneruser", null)).isFalse();
+        assertThat(verifier.isOwnerOrAdmin(42L, null)).isFalse();
     }
 
     @Test
     void verify_nullAuthentication_throwsAccessDenied() {
-        assertThatThrownBy(() -> verifier.verify("owneruser", null))
+        assertThatThrownBy(() -> verifier.verify(42L, null))
                 .isInstanceOf(AccessDeniedException.class);
     }
 }
@@ -378,34 +380,34 @@ public class OwnershipVerifier {
 
     /**
      * Checks if the authenticated user is the resource owner or an admin.
-     * Uses auth.getName() which returns the username (aligned with Phase 1B's
-     * CustomUserDetailsService which stores username as the principal name).
+     * Uses auth.getName() which returns the accountId as a String (aligned with
+     * Phase 1B's CustomUserDetailsService which stores accountId as the principal name).
      *
-     * @param resourceOwnerUsername the username of the resource owner
+     * @param resourceOwnerAccountId the accountId of the resource owner
      * @param authentication the current authentication, may be null
      * @return true if the user is the owner or has ROLE_ADMIN
      */
-    public boolean isOwnerOrAdmin(String resourceOwnerUsername, Authentication authentication) {
+    public boolean isOwnerOrAdmin(Long resourceOwnerAccountId, Authentication authentication) {
         if (authentication == null || authentication.getPrincipal() == null) {
             return false;
         }
-        String currentUsername = authentication.getName();
-        if (currentUsername.equals(resourceOwnerUsername)) {
+        Long currentAccountId = Long.valueOf(authentication.getName());
+        if (currentAccountId.equals(resourceOwnerAccountId)) {
             return true;
         }
         return authentication.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
     }
 
-    public void verify(String resourceOwnerUsername, Authentication authentication) {
-        if (!isOwnerOrAdmin(resourceOwnerUsername, authentication)) {
+    public void verify(Long resourceOwnerAccountId, Authentication authentication) {
+        if (!isOwnerOrAdmin(resourceOwnerAccountId, authentication)) {
             throw new AccessDeniedException("You do not have permission to access this resource");
         }
     }
 }
 ```
 
-> **Note:** This uses `String` username for ownership checks, aligned with Phase 1B's `CustomUserDetailsService` which stores the username as the principal name. Service methods that need ownership verification should look up the resource's owner username and pass it here.
+> **Note:** This uses `Long` accountId for ownership checks, aligned with Phase 1B's `CustomUserDetailsService` which stores the accountId as the principal name. Service methods that need ownership verification should pass the resource owner's accountId.
 
 **Step 4: Run test to verify it passes**
 
@@ -459,7 +461,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
 @Entity
-@Table(name = "categories")
+@Table(name = "category")
 public class Category {
 
     @Id
@@ -468,8 +470,8 @@ public class Category {
     private Long id;
 
     @NotBlank
-    @Size(max = 50)
-    @Column(name = "category_name", nullable = false, unique = true, length = 50)
+    @Size(max = 100)
+    @Column(name = "category_name", nullable = false, unique = true, length = 100)
     private String categoryName;
 
     @Size(max = 255)
@@ -512,7 +514,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 @Entity
-@Table(name = "tags")
+@Table(name = "tag")
 public class Tag {
 
     @Id
@@ -570,7 +572,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 @Entity
-@Table(name = "blog_posts")
+@Table(name = "blog_post")
 @FilterDef(name = "deletedFilter", parameters = @ParamDef(name = "isDeleted", type = Boolean.class))
 @Filter(name = "deletedFilter", condition = "is_deleted = :isDeleted")
 public class BlogPost extends AuditableEntity {
@@ -582,12 +584,12 @@ public class BlogPost extends AuditableEntity {
 
     @NotBlank
     @Size(max = 255)
-    @Column(name = "post_title", nullable = false, unique = true, length = 255)
+    @Column(name = "title", nullable = false, length = 255)
     private String title;
 
     @NotBlank
     @Size(max = 100000)
-    @Column(name = "post_content", nullable = false, columnDefinition = "TEXT")
+    @Column(name = "content", nullable = false, columnDefinition = "TEXT")
     private String content;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -595,7 +597,7 @@ public class BlogPost extends AuditableEntity {
     private UserAccount author;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "category_id", nullable = false)
+    @JoinColumn(name = "category_id")
     private Category category;
 
     @ManyToMany
@@ -650,7 +652,7 @@ Create `backend/src/main/java/com/blogplatform/post/PostUpdateLog.java`:
 package com.blogplatform.post;
 
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
 @Table(name = "post_update_log")
@@ -678,11 +680,11 @@ public class PostUpdateLog {
     private String newContent;
 
     @Column(name = "updated_at", nullable = false)
-    private LocalDateTime updatedAt;
+    private Instant updatedAt;
 
     @PrePersist
     protected void onCreate() {
-        updatedAt = LocalDateTime.now();
+        updatedAt = Instant.now();
     }
 
     public PostUpdateLog() {}
@@ -699,8 +701,8 @@ public class PostUpdateLog {
     public void setOldContent(String oldContent) { this.oldContent = oldContent; }
     public String getNewContent() { return newContent; }
     public void setNewContent(String newContent) { this.newContent = newContent; }
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
+    public Instant getUpdatedAt() { return updatedAt; }
+    public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -760,11 +762,11 @@ package com.blogplatform.post;
 
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.Objects;
 
 @Entity
-@Table(name = "read_posts")
+@Table(name = "read_post")
 @IdClass(ReadPostId.class)
 public class ReadPost {
 
@@ -779,7 +781,7 @@ public class ReadPost {
     private BlogPost post;
 
     @Column(name = "read_at", nullable = false)
-    private LocalDateTime readAt;
+    private Instant readAt;
 
     public ReadPost() {}
 
@@ -787,8 +789,8 @@ public class ReadPost {
     public void setAccount(UserAccount account) { this.account = account; }
     public BlogPost getPost() { return post; }
     public void setPost(BlogPost post) { this.post = post; }
-    public LocalDateTime getReadAt() { return readAt; }
-    public void setReadAt(LocalDateTime readAt) { this.readAt = readAt; }
+    public Instant getReadAt() { return readAt; }
+    public void setReadAt(Instant readAt) { this.readAt = readAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -802,7 +804,7 @@ public class ReadPost {
     @Override
     public int hashCode() {
         return Objects.hash(
-                account != null ? account.getId() : null,
+                account != null ? account.getAccountId() : null,
                 post != null ? post.getId() : null);
     }
 }
@@ -852,11 +854,11 @@ package com.blogplatform.post;
 
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.Objects;
 
 @Entity
-@Table(name = "saved_posts")
+@Table(name = "saved_post")
 @IdClass(SavedPostId.class)
 public class SavedPost {
 
@@ -871,7 +873,7 @@ public class SavedPost {
     private BlogPost post;
 
     @Column(name = "saved_at", nullable = false)
-    private LocalDateTime savedAt;
+    private Instant savedAt;
 
     public SavedPost() {}
 
@@ -879,8 +881,8 @@ public class SavedPost {
     public void setAccount(UserAccount account) { this.account = account; }
     public BlogPost getPost() { return post; }
     public void setPost(BlogPost post) { this.post = post; }
-    public LocalDateTime getSavedAt() { return savedAt; }
-    public void setSavedAt(LocalDateTime savedAt) { this.savedAt = savedAt; }
+    public Instant getSavedAt() { return savedAt; }
+    public void setSavedAt(Instant savedAt) { this.savedAt = savedAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -894,7 +896,7 @@ public class SavedPost {
     @Override
     public int hashCode() {
         return Objects.hash(
-                account != null ? account.getId() : null,
+                account != null ? account.getAccountId() : null,
                 post != null ? post.getId() : null);
     }
 }
@@ -909,10 +911,10 @@ import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
-@Table(name = "comments")
+@Table(name = "comment")
 public class Comment {
 
     @Id
@@ -922,7 +924,7 @@ public class Comment {
 
     @NotBlank
     @Size(max = 250)
-    @Column(name = "comment_text", nullable = false, length = 250)
+    @Column(name = "content", nullable = false, length = 250)
     private String content;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -938,11 +940,11 @@ public class Comment {
     private Comment parentComment;
 
     @Column(name = "created_at", nullable = false, updatable = false)
-    private LocalDateTime createdAt;
+    private Instant createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
+        createdAt = Instant.now();
     }
 
     public Comment() {}
@@ -957,7 +959,7 @@ public class Comment {
     public void setPost(BlogPost post) { this.post = post; }
     public Comment getParentComment() { return parentComment; }
     public void setParentComment(Comment parentComment) { this.parentComment = parentComment; }
-    public LocalDateTime getCreatedAt() { return createdAt; }
+    public Instant getCreatedAt() { return createdAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -980,7 +982,7 @@ package com.blogplatform.like;
 import com.blogplatform.post.BlogPost;
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
 @Table(name = "post_like", uniqueConstraints =
@@ -1001,11 +1003,11 @@ public class Like {
     private BlogPost post;
 
     @Column(name = "created_at", nullable = false, updatable = false)
-    private LocalDateTime createdAt;
+    private Instant createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
+        createdAt = Instant.now();
     }
 
     public Like() {}
@@ -1016,7 +1018,7 @@ public class Like {
     public void setAccount(UserAccount account) { this.account = account; }
     public BlogPost getPost() { return post; }
     public void setPost(BlogPost post) { this.post = post; }
-    public LocalDateTime getCreatedAt() { return createdAt; }
+    public Instant getCreatedAt() { return createdAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -1070,9 +1072,8 @@ public class AuthorProfile {
     @Column(name = "social_links", columnDefinition = "jsonb")
     private Map<String, String> socialLinks;
 
-    @NotBlank
     @Size(max = 255)
-    @Column(name = "expertise", nullable = false, length = 255)
+    @Column(name = "expertise", length = 255)
     private String expertise;
 
     public AuthorProfile() {}
@@ -1108,7 +1109,7 @@ package com.blogplatform.subscription;
 
 import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
 @Table(name = "subscriber")
@@ -1123,14 +1124,11 @@ public class Subscriber {
     @JoinColumn(name = "account_id", nullable = false, unique = true)
     private UserAccount account;
 
-    @Column(name = "subscription_date", nullable = false)
-    private LocalDateTime subscribedAt;
-
-    @Column(name = "is_active", nullable = false)
-    private boolean active = true;
+    @Column(name = "subscribed_at", nullable = false)
+    private Instant subscribedAt;
 
     @Column(name = "expiration_date")
-    private LocalDateTime expirationDate;
+    private Instant expirationDate;
 
     public Subscriber() {}
 
@@ -1138,12 +1136,10 @@ public class Subscriber {
     public void setId(Long id) { this.id = id; }
     public UserAccount getAccount() { return account; }
     public void setAccount(UserAccount account) { this.account = account; }
-    public LocalDateTime getSubscribedAt() { return subscribedAt; }
-    public void setSubscribedAt(LocalDateTime subscribedAt) { this.subscribedAt = subscribedAt; }
-    public boolean isActive() { return active; }
-    public void setActive(boolean active) { this.active = active; }
-    public LocalDateTime getExpirationDate() { return expirationDate; }
-    public void setExpirationDate(LocalDateTime expirationDate) { this.expirationDate = expirationDate; }
+    public Instant getSubscribedAt() { return subscribedAt; }
+    public void setSubscribedAt(Instant subscribedAt) { this.subscribedAt = subscribedAt; }
+    public Instant getExpirationDate() { return expirationDate; }
+    public void setExpirationDate(Instant expirationDate) { this.expirationDate = expirationDate; }
 
     @Override
     public boolean equals(Object o) {
@@ -1181,7 +1177,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 /**
  * Payment entity — stub for Phase 1. Payment processing is deferred to Phase 5+.
@@ -1207,21 +1203,16 @@ public class Payment {
 
     @NotNull
     @Enumerated(EnumType.STRING)
-    @Column(name = "payment_method", nullable = false, length = 50)
+    @Column(name = "payment_method", nullable = false, length = 20)
     private PaymentMethod paymentMethod;
 
     @NotBlank
-    @Size(max = 50)
-    @Column(name = "transaction_id", nullable = false, unique = true, length = 50)
+    @Size(max = 255)
+    @Column(name = "transaction_id", nullable = false, unique = true, length = 255)
     private String transactionId;
 
-    @NotBlank
-    @Size(max = 255)
-    @Column(name = "payment_description", nullable = false)
-    private String paymentDescription;
-
     @Column(name = "payment_date", nullable = false)
-    private LocalDateTime paymentDate;
+    private Instant paymentDate;
 
     public Payment() {}
 
@@ -1235,10 +1226,8 @@ public class Payment {
     public void setPaymentMethod(PaymentMethod paymentMethod) { this.paymentMethod = paymentMethod; }
     public String getTransactionId() { return transactionId; }
     public void setTransactionId(String transactionId) { this.transactionId = transactionId; }
-    public String getPaymentDescription() { return paymentDescription; }
-    public void setPaymentDescription(String paymentDescription) { this.paymentDescription = paymentDescription; }
-    public LocalDateTime getPaymentDate() { return paymentDate; }
-    public void setPaymentDate(LocalDateTime paymentDate) { this.paymentDate = paymentDate; }
+    public Instant getPaymentDate() { return paymentDate; }
+    public void setPaymentDate(Instant paymentDate) { this.paymentDate = paymentDate; }
 
     @Override
     public boolean equals(Object o) {
@@ -1262,10 +1251,10 @@ import com.blogplatform.user.UserAccount;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
-@Table(name = "notifications", indexes = {
+@Table(name = "notification", indexes = {
     @Index(name = "idx_notification_account_read_created",
            columnList = "account_id, is_read, created_at")
 })
@@ -1289,11 +1278,11 @@ public class Notification {
     private boolean read = false;
 
     @Column(name = "created_at", nullable = false, updatable = false)
-    private LocalDateTime createdAt;
+    private Instant createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
+        createdAt = Instant.now();
     }
 
     public Notification() {}
@@ -1306,7 +1295,7 @@ public class Notification {
     public void setMessage(String message) { this.message = message; }
     public boolean isRead() { return read; }
     public void setRead(boolean read) { this.read = read; }
-    public LocalDateTime getCreatedAt() { return createdAt; }
+    public Instant getCreatedAt() { return createdAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -1330,10 +1319,10 @@ import com.blogplatform.post.BlogPost;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
-@Table(name = "images")
+@Table(name = "image")
 public class Image {
 
     @Id
@@ -1347,7 +1336,7 @@ public class Image {
 
     @Size(max = 255)
     @Pattern(regexp = "^/uploads/.*", message = "Image URL must be a server upload path")
-    @Column(name = "image_url", unique = true)
+    @Column(name = "image_url", nullable = false, length = 500)
     private String imageUrl;
 
     @Size(max = 255)
@@ -1355,11 +1344,11 @@ public class Image {
     private String altText;
 
     @Column(name = "uploaded_at", nullable = false)
-    private LocalDateTime uploadedAt;
+    private Instant uploadedAt;
 
     @PrePersist
     protected void onCreate() {
-        uploadedAt = LocalDateTime.now();
+        uploadedAt = Instant.now();
     }
 
     public Image() {}
@@ -1372,7 +1361,7 @@ public class Image {
     public void setImageUrl(String imageUrl) { this.imageUrl = imageUrl; }
     public String getAltText() { return altText; }
     public void setAltText(String altText) { this.altText = altText; }
-    public LocalDateTime getUploadedAt() { return uploadedAt; }
+    public Instant getUploadedAt() { return uploadedAt; }
 
     @Override
     public boolean equals(Object o) {
@@ -1433,10 +1422,12 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -1450,15 +1441,18 @@ class AuthFlowIT {
     @Container
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
 
+    @Container
+    static GenericContainer<?> redis = new GenericContainer<>("redis:7")
+            .withExposedPorts(6379);
+
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", postgres::getJdbcUrl);
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
-        // Uses in-memory sessions for test simplicity.
-        // Redis-backed session persistence is tested separately if needed
-        // (requires Redis Testcontainer). Auth logic is the focus here.
-        registry.add("spring.session.store-type", () -> "none");
+        registry.add("spring.data.redis.host", redis::getHost);
+        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+        registry.add("spring.data.redis.password", () -> "");
     }
 
     @Autowired
@@ -1472,6 +1466,7 @@ class AuthFlowIT {
         // 1. Register
         var register = new RegisterRequest("flowuser", "flow@example.com", "Password1");
         mockMvc.perform(post("/api/v1/auth/register")
+                        .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(register)))
                 .andExpect(status().isCreated())
@@ -1481,6 +1476,7 @@ class AuthFlowIT {
         // 2. Login
         var login = new LoginRequest("flowuser", "Password1");
         MvcResult loginResult = mockMvc.perform(post("/api/v1/auth/login")
+                        .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(login)))
                 .andExpect(status().isOk())
@@ -1495,7 +1491,7 @@ class AuthFlowIT {
                 .andExpect(jsonPath("$.data.username").value("flowuser"));
 
         // 4. Logout
-        mockMvc.perform(post("/api/v1/auth/logout").session(session))
+        mockMvc.perform(post("/api/v1/auth/logout").session(session).with(csrf()))
                 .andExpect(status().isOk());
 
         // 5. GET /me after logout with same (now-invalidated) session — rejected

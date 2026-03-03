@@ -1037,6 +1037,7 @@ class AuthControllerTest {
         registry.add("spring.datasource.password", postgres::getPassword);
         registry.add("spring.data.redis.host", redis::getHost);
         registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+        registry.add("spring.data.redis.password", () -> "");
     }
 
     @Autowired
@@ -1275,6 +1276,7 @@ git commit -m "feat: add AuthController with register, login (unified auth path)
 | v1.0 | 2026-03-01 | Initial plan — Tasks 6-11 covering entities, Spring Security, DTOs, AuthService, AuthController |
 | v1.1 | 2026-03-03 | Applied critical review v1 fixes (15 findings) |
 | v1.2 | 2026-03-03 | Applied critical review v2 fixes (5 critical, 3 minor validated) |
+| v1.3 | 2026-03-03 | Pre-implementation review: added empty Redis password to AuthControllerTest DynamicPropertySource |
 
 ### v1.1 Changes (Critical Review 1)
 
