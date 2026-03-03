@@ -90,6 +90,7 @@ dependencies {
     testImplementation 'org.springframework.security:spring-security-test'
     testImplementation 'org.testcontainers:junit-jupiter'
     testImplementation 'org.testcontainers:postgresql'
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
 }
 
 tasks.named('test') {
@@ -173,12 +174,16 @@ spring:
     show-sql: false
   session:
     store-type: none
+  flyway:
+    enabled: true
 
 logging:
   level:
     root: WARN
     com.blogplatform: INFO
 ```
+
+> **Note:** Integration tests must use an abstract base test class with `@ServiceConnection` and a shared static Testcontainers `PostgreSQLContainer`. This provides the datasource dynamically — no hardcoded JDBC URL is needed in this profile. See Task 5 for the base test class pattern.
 
 Create `backend/src/main/resources/application-prod.yml`:
 ```yaml
@@ -201,17 +206,24 @@ logging:
     org.springframework.web: WARN
 ```
 
-**Step 2: Verify the project compiles**
+**Step 2: Generate the Gradle wrapper**
+
+Run: `cd backend && gradle wrapper --gradle-version 8.12`
+Expected: Creates `gradlew`, `gradlew.bat`, and `gradle/wrapper/` directory.
+
+**Step 3: Verify the project compiles**
 
 Run: `cd backend && ./gradlew compileJava`
-Expected: BUILD SUCCESSFUL (may need to generate Gradle wrapper first)
+Expected: BUILD SUCCESSFUL
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
 git add backend/
 git commit -m "feat: initialize Spring Boot project with Gradle and dependencies"
 ```
+
+> **Note:** Commit the Gradle wrapper files (`gradlew`, `gradlew.bat`, `gradle/wrapper/*`) — these are required for reproducible builds.
 
 ---
 
@@ -301,11 +313,11 @@ CREATE TABLE user_account (
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) NOT NULL DEFAULT 'USER',
     is_vip BOOLEAN NOT NULL DEFAULT FALSE,
-    vip_start_date TIMESTAMP,
-    vip_end_date TIMESTAMP,
+    vip_start_date TIMESTAMPTZ,
+    vip_end_date TIMESTAMPTZ,
     two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     email_verified BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- UserProfile
@@ -316,7 +328,7 @@ CREATE TABLE user_profile (
     last_name VARCHAR(50),
     bio TEXT,
     profile_pic_url VARCHAR(500),
-    last_login TIMESTAMP,
+    last_login TIMESTAMPTZ,
     login_count INTEGER NOT NULL DEFAULT 0
 );
 
@@ -343,6 +355,8 @@ CREATE TABLE tag (
 );
 
 -- BlogPost
+-- Note: author_id references user_account(account_id), not author_profile.
+-- Any user can author posts; an author_profile is optional supplemental data.
 CREATE TABLE blog_post (
     post_id BIGSERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
@@ -352,8 +366,8 @@ CREATE TABLE blog_post (
     is_premium BOOLEAN NOT NULL DEFAULT FALSE,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     search_vector TSVECTOR,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_blog_post_author ON blog_post(author_id);
@@ -362,8 +376,8 @@ CREATE INDEX idx_blog_post_search_vector ON blog_post USING GIN(search_vector);
 
 -- PostTags (join table)
 CREATE TABLE post_tags (
-    post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
-    tag_id BIGINT NOT NULL REFERENCES tag(tag_id),
+    post_id BIGINT NOT NULL REFERENCES blog_post(post_id) ON DELETE CASCADE,
+    tag_id BIGINT NOT NULL REFERENCES tag(tag_id) ON DELETE CASCADE,
     PRIMARY KEY (post_id, tag_id)
 );
 
@@ -375,7 +389,7 @@ CREATE TABLE post_update_log (
     new_title VARCHAR(255),
     old_content TEXT,
     new_content TEXT,
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_post_update_log_post ON post_update_log(post_id);
@@ -387,7 +401,7 @@ CREATE TABLE comment (
     account_id BIGINT NOT NULL REFERENCES user_account(account_id),
     post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
     parent_comment_id BIGINT REFERENCES comment(comment_id),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_comment_post ON comment(post_id);
@@ -398,25 +412,25 @@ CREATE TABLE post_like (
     like_id BIGSERIAL PRIMARY KEY,
     account_id BIGINT NOT NULL REFERENCES user_account(account_id),
     post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (account_id, post_id)
 );
 
 CREATE INDEX idx_like_post ON post_like(post_id);
 
--- ReadPost
+-- ReadPost (join table)
 CREATE TABLE read_post (
-    account_id BIGINT NOT NULL REFERENCES user_account(account_id),
-    post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
-    read_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    account_id BIGINT NOT NULL REFERENCES user_account(account_id) ON DELETE CASCADE,
+    post_id BIGINT NOT NULL REFERENCES blog_post(post_id) ON DELETE CASCADE,
+    read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (account_id, post_id)
 );
 
--- SavedPost
+-- SavedPost (join table)
 CREATE TABLE saved_post (
-    account_id BIGINT NOT NULL REFERENCES user_account(account_id),
-    post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
-    saved_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    account_id BIGINT NOT NULL REFERENCES user_account(account_id) ON DELETE CASCADE,
+    post_id BIGINT NOT NULL REFERENCES blog_post(post_id) ON DELETE CASCADE,
+    saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (account_id, post_id)
 );
 
@@ -424,8 +438,8 @@ CREATE TABLE saved_post (
 CREATE TABLE subscriber (
     subscriber_id BIGSERIAL PRIMARY KEY,
     account_id BIGINT NOT NULL UNIQUE REFERENCES user_account(account_id),
-    subscribed_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    expiration_date TIMESTAMP
+    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expiration_date TIMESTAMPTZ
 );
 
 -- Payment
@@ -435,7 +449,7 @@ CREATE TABLE payment (
     amount NUMERIC(10, 2) NOT NULL CHECK (amount > 0),
     payment_method VARCHAR(20) NOT NULL,
     transaction_id VARCHAR(255) NOT NULL UNIQUE,
-    payment_date TIMESTAMP NOT NULL DEFAULT NOW()
+    payment_date TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_payment_account ON payment(account_id);
@@ -446,7 +460,7 @@ CREATE TABLE notification (
     account_id BIGINT NOT NULL REFERENCES user_account(account_id),
     message TEXT NOT NULL,
     is_read BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_notification_account_read_created ON notification(account_id, is_read, created_at);
@@ -457,7 +471,7 @@ CREATE TABLE image (
     post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
     image_url VARCHAR(500) NOT NULL,
     alt_text VARCHAR(255),
-    uploaded_at TIMESTAMP NOT NULL DEFAULT NOW()
+    uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_image_post ON image(post_id);
@@ -467,7 +481,7 @@ CREATE TABLE password_reset_token (
     id BIGSERIAL PRIMARY KEY,
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     account_id BIGINT NOT NULL REFERENCES user_account(account_id),
-    expires_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
     used BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -476,7 +490,7 @@ CREATE TABLE email_verification_token (
     id BIGSERIAL PRIMARY KEY,
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     account_id BIGINT NOT NULL REFERENCES user_account(account_id),
-    expires_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
     used BOOLEAN NOT NULL DEFAULT FALSE
 );
 ```
@@ -513,14 +527,16 @@ INSERT INTO category (category_name, description) VALUES
     ('Travel', 'Destinations, tips, and travel stories'),
     ('Food', 'Recipes, reviews, and culinary adventures');
 
--- Admin user (password: Admin123! — BCrypt hash with work factor 12)
+-- Dev-only admin user (BCrypt hash with work factor 12)
+-- IMPORTANT: Production deployments must create admin accounts through a secure process.
+-- Do NOT rely on this seed data in production.
 INSERT INTO user_account (username, email, password_hash, role, email_verified)
 VALUES ('admin', 'admin@blogplatform.com',
         '$2a$12$LJ3m4ys3uz0b/tMkgqHUZeJ0SJyKfxBVOKFqW8GbMFmJN7gmPVqtG',
         'ADMIN', TRUE);
 
 INSERT INTO user_profile (account_id, first_name, last_name)
-VALUES (1, 'System', 'Admin');
+SELECT account_id, 'System', 'Admin' FROM user_account WHERE username = 'admin';
 ```
 
 **Step 2: Write repeatable search vector trigger migration**
@@ -590,7 +606,9 @@ git commit -m "feat: add seed data and search vector trigger migrations"
 - Create: `backend/src/main/java/com/blogplatform/common/exception/ForbiddenException.java`
 - Create: `backend/src/main/java/com/blogplatform/common/exception/BadRequestException.java`
 - Create: `backend/src/main/java/com/blogplatform/common/exception/GlobalExceptionHandler.java`
+- Create: `backend/src/main/java/com/blogplatform/common/audit/CreatedAtEntity.java`
 - Create: `backend/src/main/java/com/blogplatform/common/audit/AuditableEntity.java`
+- Create: `backend/src/test/java/com/blogplatform/BaseIntegrationTest.java`
 
 **Step 1: Write the common classes**
 
@@ -624,6 +642,8 @@ Create `backend/src/main/java/com/blogplatform/common/dto/PagedResponse.java`:
 ```java
 package com.blogplatform.common.dto;
 
+import org.springframework.data.domain.Page;
+
 import java.util.List;
 
 public record PagedResponse<T>(
@@ -634,6 +654,16 @@ public record PagedResponse<T>(
         int totalPages,
         boolean last
 ) {
+    public static <T> PagedResponse<T> from(Page<T> page) {
+        return new PagedResponse<>(
+                page.getContent(),
+                page.getNumber(),
+                page.getSize(),
+                page.getTotalElements(),
+                page.getTotalPages(),
+                page.isLast()
+        );
+    }
 }
 ```
 
@@ -686,6 +716,8 @@ Create `backend/src/main/java/com/blogplatform/common/exception/GlobalExceptionH
 package com.blogplatform.common.exception;
 
 import com.blogplatform.common.dto.ApiResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
@@ -697,6 +729,8 @@ import java.util.stream.Collectors;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     @ExceptionHandler(ResourceNotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(ResourceNotFoundException ex) {
@@ -729,6 +763,39 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining(", "));
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(ApiResponse.error(errors));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnexpected(Exception ex) {
+        log.error("Unexpected error", ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("An unexpected error occurred"));
+    }
+}
+```
+
+Create `backend/src/main/java/com/blogplatform/common/audit/CreatedAtEntity.java`:
+```java
+package com.blogplatform.common.audit;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.MappedSuperclass;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public abstract class CreatedAtEntity {
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    public Instant getCreatedAt() {
+        return createdAt;
     }
 }
 ```
@@ -768,18 +835,75 @@ public abstract class AuditableEntity {
 }
 ```
 
-**Step 2: Verify it compiles**
+> **Usage:** Entities for tables with both `created_at` and `updated_at` (e.g., `blog_post`) extend `AuditableEntity`. Entities for tables with only `created_at` (e.g., `comment`, `notification`, `post_like`) extend `CreatedAtEntity`.
 
-Run: `cd backend && ./gradlew compileJava`
+**Step 2: Create the integration test base class**
+
+Create `backend/src/test/java/com/blogplatform/BaseIntegrationTest.java`:
+```java
+package com.blogplatform;
+
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.test.context.ActiveProfiles;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+@SpringBootTest
+@Testcontainers
+@ActiveProfiles("test")
+public abstract class BaseIntegrationTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+            new PostgreSQLContainer<>("postgres:16");
+}
+```
+
+> **Note:** All integration tests should extend `BaseIntegrationTest`. The shared static container is reused across all test classes in a single test run.
+
+**Step 3: Verify it compiles**
+
+Run: `cd backend && ./gradlew compileJava compileTestJava`
 Expected: BUILD SUCCESSFUL
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add backend/src/main/java/com/blogplatform/common/
-git commit -m "feat: add common layer — ApiResponse, exceptions, AuditableEntity"
+git add backend/src/main/java/com/blogplatform/common/ backend/src/test/java/com/blogplatform/BaseIntegrationTest.java
+git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEntity, AuditableEntity, base test class"
 ```
 
 ---
 
 > **Next:** Continue to Phase 1B for Tasks 6-10.
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v1.0 | 2026-03-01 | Initial plan |
+| v1.1 | 2026-03-03 | Applied critical review fixes (see below) |
+
+### v1.1 Changes (Critical Review 1)
+
+**Critical fixes:**
+- **C1 — Seed data ID assumption:** Changed `VALUES (1, 'System', 'Admin')` to `SELECT account_id ... FROM user_account WHERE username = 'admin'` (Task 4)
+- **C2 — AuditableEntity schema mismatch:** Split into `CreatedAtEntity` (created_at only) and `AuditableEntity` (created_at + updated_at). Added usage guidance. (Task 5)
+- **C3 — Test datasource missing:** Added `BaseIntegrationTest` abstract class with `@ServiceConnection` and shared Testcontainers `PostgreSQLContainer`. Added `spring-boot-testcontainers` dependency. Added note in `application-test.yml`. (Tasks 1, 5)
+- **C4 — Plaintext admin password:** Removed plaintext password from seed data comment. Added production deployment warning. (Task 4)
+- **C5 — No Gradle wrapper:** Added explicit `gradle wrapper` generation step before compilation. Added commit note for wrapper files. (Task 1)
+
+**Minor fixes:**
+- **M1 — Missing Testcontainers dependency:** Added `spring-boot-testcontainers` to test dependencies (supersedes generic testcontainers module). (Task 1)
+- **M2 — TIMESTAMP vs TIMESTAMPTZ:** Changed all `TIMESTAMP` columns to `TIMESTAMPTZ` for timezone safety. (Task 3)
+- **M3 — ON DELETE CASCADE for join tables:** Added `ON DELETE CASCADE` to `post_tags`, `read_post`, and `saved_post` foreign keys. (Task 3)
+- **M4 — GlobalExceptionHandler catch-all:** Added `@ExceptionHandler(Exception.class)` with logging and generic 500 response. (Task 5)
+- **M5 — PagedResponse factory method:** Added `public static <T> PagedResponse<T> from(Page<T> page)` convenience method. (Task 5)
+- **M7 — author_id naming clarity:** Added SQL comment explaining that `blog_post.author_id` references `user_account(account_id)`. (Task 3)
+
+**Review reference:** `docs/plans/2026-03-01-phase1a-project-setup-implementation-critical-review-1.md`
