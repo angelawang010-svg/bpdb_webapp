@@ -5,7 +5,15 @@
 **Auditor:** LCSA — White-box plan review
 **Review status:** All findings verified and dispositioned with project owner.
 
+**Version:** 1.0
+
 **Scope:** This is a plan-level security review (no running code). All findings are based on the code snippets and architectural decisions specified in the plan. Confidence levels reflect that this is a design review, not a runtime analysis.
+
+## Changelog
+
+| Version | Date | Description |
+|---------|------|-------------|
+| 1.0 | 2026-03-03 | Initial audit. 10 findings identified, all dispositioned with project owner. Finding #2 scoped to email-only enumeration per owner decision (usernames are public identifiers). |
 
 ---
 
