@@ -26,6 +26,7 @@
 |---------|------|---------|
 | 1.0 | 2026-03-01 | Initial plan |
 | 1.1 | 2026-03-03 | Critical review fixes: Task 11 rewritten (Caffeine cache, IP spoofing fix, double-filter fix, URL pattern fix, accurate Retry-After, added tests), Task 12 null safety + principal type alignment, Task 13 full entity code for all 16 files, Task 15 git add fix. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-1.md` for review details. |
+| 1.2 | 2026-03-03 | Critical review v2 fixes: Removed RateLimitConfig (use @Order on filter), fixed anonymous user check to use auth.getName(), removed redundant UniqueConstraint from SavedPost, added @PrePersist to PostUpdateLog, added equals()/hashCode() to all 11 entities, fixed AuthFlowIT to pass invalidated session, added staging comment to Task 15. See `2026-03-01-phase1c-ratelimit-entities-implementation-critical-review-2.md`. |
 
 ---
 
@@ -33,7 +34,6 @@
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/config/RateLimitFilter.java`
-- Create: `backend/src/main/java/com/blogplatform/config/RateLimitConfig.java`
 - Create: `backend/src/test/java/com/blogplatform/config/RateLimitFilterTest.java`
 
 **Step 1: Write the rate limit filter**
@@ -53,8 +53,10 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.annotation.Order;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
@@ -75,6 +77,8 @@ import java.util.concurrent.TimeUnit;
  * a reverse proxy, configure server.forward-headers-strategy=NATIVE in
  * application.properties so Spring resolves the real client IP.
  */
+@Component
+@Order(1)
 public class RateLimitFilter extends OncePerRequestFilter {
 
     private final Cache<String, Bucket> buckets = Caffeine.newBuilder()
@@ -103,7 +107,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         boolean isAuthEndpoint = request.getRequestURI().startsWith("/api/v1/auth/");
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         boolean isAuthenticated = auth != null && auth.isAuthenticated()
-                && !"anonymousUser".equals(auth.getPrincipal());
+                && !"anonymousUser".equals(auth.getName());
 
         if (isAuthEndpoint) {
             key = "auth:" + request.getRemoteAddr();
@@ -140,32 +144,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
 }
 ```
 
-Create `backend/src/main/java/com/blogplatform/config/RateLimitConfig.java`:
-```java
-package com.blogplatform.config;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-@Configuration
-public class RateLimitConfig {
-
-    @Bean
-    public RateLimitFilter rateLimitFilter(ObjectMapper objectMapper) {
-        return new RateLimitFilter(objectMapper);
-    }
-
-    @Bean
-    public FilterRegistrationBean<RateLimitFilter> rateLimitFilterRegistration(RateLimitFilter filter) {
-        FilterRegistrationBean<RateLimitFilter> registration = new FilterRegistrationBean<>(filter);
-        registration.addUrlPatterns("/api/*");
-        registration.setOrder(1);
-        return registration;
-    }
-}
-```
+> **Note:** No separate `RateLimitConfig` class needed — the filter is registered via `@Component` and ordered via `@Order(1)`. Path filtering is handled by `shouldNotFilter()`.
 
 **Step 2: Write rate limiting tests**
 
@@ -297,7 +276,7 @@ Expected: All 5 tests PASS.
 **Step 5: Commit**
 
 ```bash
-git add backend/src/main/java/com/blogplatform/config/RateLimitFilter.java backend/src/main/java/com/blogplatform/config/RateLimitConfig.java backend/src/test/java/com/blogplatform/config/RateLimitFilterTest.java
+git add backend/src/main/java/com/blogplatform/config/RateLimitFilter.java backend/src/test/java/com/blogplatform/config/RateLimitFilterTest.java
 git commit -m "feat: add Bucket4j rate limiting — tiered by user type with Caffeine cache"
 ```
 
@@ -504,6 +483,18 @@ public class Category {
     public void setCategoryName(String categoryName) { this.categoryName = categoryName; }
     public String getDescription() { return description; }
     public void setDescription(String description) { this.description = description; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Category that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -544,6 +535,18 @@ public class Tag {
     public void setTagName(String tagName) { this.tagName = tagName; }
     public Set<BlogPost> getPosts() { return posts; }
     public void setPosts(Set<BlogPost> posts) { this.posts = posts; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Tag that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -626,6 +629,18 @@ public class BlogPost extends AuditableEntity {
     public void setPremium(boolean premium) { this.premium = premium; }
     public boolean isDeleted() { return deleted; }
     public void setDeleted(boolean deleted) { this.deleted = deleted; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof BlogPost that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -664,6 +679,11 @@ public class PostUpdateLog {
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
 
+    @PrePersist
+    protected void onCreate() {
+        updatedAt = LocalDateTime.now();
+    }
+
     public PostUpdateLog() {}
 
     public Long getId() { return id; }
@@ -680,6 +700,18 @@ public class PostUpdateLog {
     public void setNewContent(String newContent) { this.newContent = newContent; }
     public LocalDateTime getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof PostUpdateLog that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -805,8 +837,7 @@ import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "saved_posts", uniqueConstraints =
-    @UniqueConstraint(columnNames = {"account_id", "post_id"}))
+@Table(name = "saved_posts")
 @IdClass(SavedPostId.class)
 public class SavedPost {
 
@@ -892,6 +923,18 @@ public class Comment {
     public Comment getParentComment() { return parentComment; }
     public void setParentComment(Comment parentComment) { this.parentComment = parentComment; }
     public LocalDateTime getCreatedAt() { return createdAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Comment that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -939,6 +982,18 @@ public class Like {
     public BlogPost getPost() { return post; }
     public void setPost(BlogPost post) { this.post = post; }
     public LocalDateTime getCreatedAt() { return createdAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Like that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -993,6 +1048,18 @@ public class AuthorProfile {
     public void setSocialLinks(Map<String, String> socialLinks) { this.socialLinks = socialLinks; }
     public String getExpertise() { return expertise; }
     public void setExpertise(String expertise) { this.expertise = expertise; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof AuthorProfile that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -1038,6 +1105,18 @@ public class Subscriber {
     public void setActive(boolean active) { this.active = active; }
     public LocalDateTime getExpirationDate() { return expirationDate; }
     public void setExpirationDate(LocalDateTime expirationDate) { this.expirationDate = expirationDate; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Subscriber that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -1121,6 +1200,18 @@ public class Payment {
     public void setPaymentDescription(String paymentDescription) { this.paymentDescription = paymentDescription; }
     public LocalDateTime getPaymentDate() { return paymentDate; }
     public void setPaymentDate(LocalDateTime paymentDate) { this.paymentDate = paymentDate; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Payment that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -1175,6 +1266,18 @@ public class Notification {
     public boolean isRead() { return read; }
     public void setRead(boolean read) { this.read = read; }
     public LocalDateTime getCreatedAt() { return createdAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Notification that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -1227,6 +1330,18 @@ public class Image {
     public String getAltText() { return altText; }
     public void setAltText(String altText) { this.altText = altText; }
     public LocalDateTime getUploadedAt() { return uploadedAt; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Image that)) return false;
+        return id != null && id.equals(that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
+    }
 }
 ```
 
@@ -1340,8 +1455,8 @@ class AuthFlowIT {
         mockMvc.perform(post("/api/v1/auth/logout").session(session))
                 .andExpect(status().isOk());
 
-        // 5. GET /me after logout — rejected
-        mockMvc.perform(get("/api/v1/auth/me"))
+        // 5. GET /me after logout with same (now-invalidated) session — rejected
+        mockMvc.perform(get("/api/v1/auth/me").session(session))
                 .andExpect(status().isUnauthorized());
     }
 }
@@ -1393,6 +1508,8 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/auth/me | jq .
 Expected: All return `{"success": true, ...}` with appropriate data.
 
 **Step 4: Commit (if any fixes were needed)**
+
+> **Note:** Only stage the specific files that were modified during smoke testing. The paths below are examples — replace with actual changed files.
 
 ```bash
 git add backend/src/main/java/com/blogplatform/ backend/src/test/java/com/blogplatform/

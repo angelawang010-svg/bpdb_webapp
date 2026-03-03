@@ -45,9 +45,9 @@ boolean isAuthenticated = auth != null && auth.isAuthenticated()
 
 ## 3. Minor Issues & Improvements
 
-### M1: Retry-After Header Still Hardcoded (Task 11)
+### ~~M1: Retry-After Header Still Hardcoded (Task 11)~~ — FALSE FINDING
 
-The 429 response writes `response.setHeader("Retry-After", "60")` regardless of actual bucket refill time. The test asserts `Retry-After` is not null but doesn't verify accuracy. Bucket4j's `ConsumptionProbe` from `tryConsumeAndReturnRemaining(1)` provides `getNanosToWaitForRefill()` for an accurate value. Well-behaved clients depend on this. Fix: use `ConsumptionProbe` and compute the real wait time in seconds.
+**Retracted:** The plan already uses `ConsumptionProbe` with `getNanosToWaitForRefill()` for accurate `Retry-After` values (fixed in v1.1). No change needed.
 
 ### M2: SavedPost Has Redundant UniqueConstraint (Task 13)
 
