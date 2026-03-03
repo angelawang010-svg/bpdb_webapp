@@ -12,7 +12,7 @@
 
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — the authoritative source for all schema, API, security, and business logic decisions.
 
-**Version:** 1.1 — Updated 2026-03-03 per critical review (`2026-03-01-phase1b-auth-security-implementation-critical-review-1.md`). All 15 review findings applied.
+**Version:** 1.2 — Updated 2026-03-03 per critical review v2 (`2026-03-01-phase1b-auth-security-implementation-critical-review-2.md`). All validated findings applied: unified auth path (2.1/2.2), lazy loading fix (2.3), 423 lockout status (2.4), atomic Redis ops (2.5), IP logging (3.1), lockout integration test (3.7), generic exception message (3.8).
 
 ## Phase 1 Parts
 
@@ -25,6 +25,8 @@
 ---
 
 ### Task 6: User & Auth Entities — UserAccount, UserProfile, Role
+
+> **Note:** Flyway migrations for `user_account` and `user_profile` tables are defined in Phase 1A (Task 4). This task only creates the JPA entity classes.
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/user/UserAccount.java`
@@ -249,7 +251,7 @@ public class CustomUserDetailsService implements UserDetailsService {
     @Override
     public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
         UserAccount account = userRepository.findByUsername(username)
-                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+                .orElseThrow(() -> new UsernameNotFoundException("Bad credentials"));
 
         return new User(
                 account.getAccountId().toString(),
@@ -532,10 +534,14 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.script.RedisScript;
 
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -574,10 +580,9 @@ class LoginAttemptServiceTest {
     }
 
     @Test
-    void recordFailure_incrementsCountWithTTL() {
-        when(valueOps.increment("login:failures:testuser")).thenReturn(1L);
-        loginAttemptService.recordFailure("testuser");
-        verify(redisTemplate).expire("login:failures:testuser", Duration.ofMinutes(15));
+    void recordFailure_executesAtomicLuaScript() {
+        loginAttemptService.recordFailure("testuser", "192.168.1.1");
+        verify(redisTemplate).execute(any(RedisScript.class), eq(List.of("login:failures:testuser")), eq("900"));
     }
 
     @Test
@@ -602,9 +607,11 @@ package com.blogplatform.auth;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.util.List;
 
 @Service
 public class LoginAttemptService {
@@ -613,6 +620,14 @@ public class LoginAttemptService {
     private static final String KEY_PREFIX = "login:failures:";
     private static final int MAX_ATTEMPTS = 5;
     private static final Duration LOCKOUT_DURATION = Duration.ofMinutes(15);
+
+    // Lua script: atomically increment the failure counter and set TTL.
+    // Guarantees the key always has an expiry — no permanent lockout on crash.
+    private static final RedisScript<Long> INCREMENT_WITH_TTL = RedisScript.of(
+            "local count = redis.call('INCR', KEYS[1]); " +
+            "redis.call('EXPIRE', KEYS[1], ARGV[1]); " +
+            "return count",
+            Long.class);
 
     private final StringRedisTemplate redisTemplate;
 
@@ -625,11 +640,11 @@ public class LoginAttemptService {
         return attempts != null && Integer.parseInt(attempts) >= MAX_ATTEMPTS;
     }
 
-    public void recordFailure(String username) {
+    public void recordFailure(String username, String ipAddress) {
         String key = KEY_PREFIX + username;
-        redisTemplate.opsForValue().increment(key);
-        redisTemplate.expire(key, LOCKOUT_DURATION);
-        log.warn("Failed login attempt for username={}", username);
+        redisTemplate.execute(INCREMENT_WITH_TTL, List.of(key),
+                String.valueOf(LOCKOUT_DURATION.getSeconds()));
+        log.warn("Failed login attempt for username={}, ip={}", username, ipAddress);
     }
 
     public void resetFailures(String username) {
@@ -652,10 +667,11 @@ git commit -m "feat: add LoginAttemptService with Redis-backed brute-force prote
 
 ---
 
-### Task 10: AuthService — Registration and Login Logic
+### Task 10: AuthService — Registration, Lockout Pre-Check, Login Tracking
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/auth/AuthService.java`
+- Create: `backend/src/main/java/com/blogplatform/common/exception/AccountLockedException.java`
 - Create: `backend/src/test/java/com/blogplatform/auth/AuthServiceTest.java`
 
 **Step 1: Write the failing test**
@@ -665,9 +681,9 @@ Create `backend/src/test/java/com/blogplatform/auth/AuthServiceTest.java`:
 package com.blogplatform.auth;
 
 import com.blogplatform.auth.dto.RegisterRequest;
+import com.blogplatform.common.exception.AccountLockedException;
 import com.blogplatform.common.exception.BadRequestException;
 import com.blogplatform.common.exception.ResourceNotFoundException;
-import com.blogplatform.common.exception.UnauthorizedException;
 import com.blogplatform.user.Role;
 import com.blogplatform.user.UserAccount;
 import com.blogplatform.user.UserProfile;
@@ -699,8 +715,6 @@ class AuthServiceTest {
     private LoginAttemptService loginAttemptService;
 
     private AuthService authService;
-
-    private static final String DUMMY_HASH = "$2a$12$dummyhashfortimingequalitypadding000000000000000000000";
 
     @BeforeEach
     void setUp() {
@@ -759,53 +773,44 @@ class AuthServiceTest {
     }
 
     @Test
-    void authenticate_withValidCredentials_returnsUser() {
-        var user = new UserAccount();
-        user.setUsername("testuser");
-        user.setPasswordHash("hashed");
-        when(loginAttemptService.isBlocked("testuser")).thenReturn(false);
-        when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(user));
-        when(passwordEncoder.matches("Password1", "hashed")).thenReturn(true);
-
-        UserAccount result = authService.authenticate("testuser", "Password1");
-
-        assertThat(result.getUsername()).isEqualTo("testuser");
-        verify(loginAttemptService).resetFailures("testuser");
-    }
-
-    @Test
-    void authenticate_withBlockedAccount_throwsLockedException() {
+    void checkLockout_withBlockedAccount_throwsAccountLockedException() {
         when(loginAttemptService.isBlocked("testuser")).thenReturn(true);
 
-        assertThatThrownBy(() -> authService.authenticate("testuser", "Password1"))
-                .isInstanceOf(BadRequestException.class)
+        assertThatThrownBy(() -> authService.checkLockout("testuser"))
+                .isInstanceOf(AccountLockedException.class)
                 .hasMessageContaining("Account temporarily locked");
     }
 
     @Test
-    void authenticate_withWrongPassword_recordsFailureAndThrowsUnauthorized() {
-        var user = new UserAccount();
-        user.setPasswordHash("hashed");
+    void checkLockout_withUnblockedAccount_doesNotThrow() {
         when(loginAttemptService.isBlocked("testuser")).thenReturn(false);
-        when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(user));
-        when(passwordEncoder.matches("wrong", "hashed")).thenReturn(false);
 
-        assertThatThrownBy(() -> authService.authenticate("testuser", "wrong"))
-                .isInstanceOf(UnauthorizedException.class);
-        verify(loginAttemptService).recordFailure("testuser");
+        authService.checkLockout("testuser"); // should not throw
     }
 
     @Test
-    void authenticate_withNonexistentUser_performsDummyHashAndThrowsUnauthorized() {
-        when(loginAttemptService.isBlocked("nobody")).thenReturn(false);
-        when(userRepository.findByUsername("nobody")).thenReturn(Optional.empty());
+    void recordLoginFailure_delegatesToLoginAttemptService() {
+        authService.recordLoginFailure("testuser", "192.168.1.1");
 
-        assertThatThrownBy(() -> authService.authenticate("nobody", "Password1"))
-                .isInstanceOf(UnauthorizedException.class);
+        verify(loginAttemptService).recordFailure("testuser", "192.168.1.1");
+    }
 
-        // Verify dummy hash comparison was performed (timing side-channel mitigation)
-        verify(passwordEncoder).matches(eq("Password1"), anyString());
-        verify(loginAttemptService).recordFailure("nobody");
+    @Test
+    void recordLoginSuccess_resetsFailuresAndUpdatesProfile() {
+        var user = new UserAccount();
+        user.setAccountId(1L);
+        var profile = new UserProfile();
+        profile.setLoginCount(3);
+        profile.setUserAccount(user);
+        user.setUserProfile(profile);
+        when(userRepository.findById(1L)).thenReturn(Optional.of(user));
+        when(userRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        UserAccount result = authService.recordLoginSuccess(1L, "testuser");
+
+        verify(loginAttemptService).resetFailures("testuser");
+        assertThat(result.getUserProfile().getLoginCount()).isEqualTo(4);
+        assertThat(result.getUserProfile().getLastLogin()).isNotNull();
     }
 
     @Test
@@ -841,9 +846,9 @@ Create `backend/src/main/java/com/blogplatform/auth/AuthService.java`:
 package com.blogplatform.auth;
 
 import com.blogplatform.auth.dto.RegisterRequest;
+import com.blogplatform.common.exception.AccountLockedException;
 import com.blogplatform.common.exception.BadRequestException;
 import com.blogplatform.common.exception.ResourceNotFoundException;
-import com.blogplatform.common.exception.UnauthorizedException;
 import com.blogplatform.user.Role;
 import com.blogplatform.user.UserAccount;
 import com.blogplatform.user.UserProfile;
@@ -854,15 +859,12 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
+
 @Service
 public class AuthService {
 
     private static final Logger log = LoggerFactory.getLogger(AuthService.class);
-
-    // Pre-computed BCrypt hash used for constant-time comparison when user is not found,
-    // mitigating timing side-channel that could reveal username existence.
-    private static final String DUMMY_HASH =
-            "$2a$12$dummyhashfortimingequalitypadding000000000000000000000";
 
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
@@ -900,30 +902,47 @@ public class AuthService {
         return userRepository.save(account);
     }
 
-    public UserAccount authenticate(String username, String password) {
+    /**
+     * Pre-authentication lockout check. Call before AuthenticationManager.authenticate().
+     * Throws AccountLockedException (423) if the account has too many failed attempts.
+     */
+    public void checkLockout(String username) {
         if (loginAttemptService.isBlocked(username)) {
             log.warn("Login attempt for locked account: username={}", username);
-            throw new BadRequestException("Account temporarily locked due to too many failed attempts. Try again later.");
+            throw new AccountLockedException(
+                    "Account temporarily locked due to too many failed attempts. Try again later.");
         }
-
-        UserAccount user = userRepository.findByUsername(username).orElse(null);
-
-        if (user == null) {
-            // Perform dummy hash comparison to prevent timing side-channel
-            passwordEncoder.matches(password, DUMMY_HASH);
-            loginAttemptService.recordFailure(username);
-            throw new UnauthorizedException("Invalid credentials");
-        }
-
-        if (!passwordEncoder.matches(password, user.getPasswordHash())) {
-            loginAttemptService.recordFailure(username);
-            throw new UnauthorizedException("Invalid credentials");
-        }
-
-        loginAttemptService.resetFailures(username);
-        return user;
     }
 
+    /**
+     * Record a failed login attempt. Called from the controller's catch block
+     * when AuthenticationManager.authenticate() throws BadCredentialsException.
+     */
+    public void recordLoginFailure(String username, String ipAddress) {
+        loginAttemptService.recordFailure(username, ipAddress);
+    }
+
+    /**
+     * Record a successful login: reset failure counter and update login tracking.
+     * Runs in a transaction to safely load UserProfile (FetchType.LAZY) and update it.
+     */
+    @Transactional
+    public UserAccount recordLoginSuccess(Long userId, String username) {
+        loginAttemptService.resetFailures(username);
+
+        UserAccount user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found"));
+
+        UserProfile profile = user.getUserProfile();
+        if (profile != null) {
+            profile.setLastLogin(Instant.now());
+            profile.setLoginCount(profile.getLoginCount() + 1);
+        }
+
+        return userRepository.save(user);
+    }
+
+    @Transactional(readOnly = true)
     public UserAccount findById(Long id) {
         return userRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
@@ -931,16 +950,36 @@ public class AuthService {
 }
 ```
 
+Create `backend/src/main/java/com/blogplatform/common/exception/AccountLockedException.java`:
+```java
+package com.blogplatform.common.exception;
+
+public class AccountLockedException extends RuntimeException {
+    public AccountLockedException(String message) {
+        super(message);
+    }
+}
+```
+
+Add the handler in the existing `GlobalExceptionHandler` (from Phase 1A):
+```java
+@ExceptionHandler(AccountLockedException.class)
+public ResponseEntity<ApiResponse<Void>> handleAccountLocked(AccountLockedException ex) {
+    return ResponseEntity.status(423)
+            .body(ApiResponse.error(ex.getMessage()));
+}
+```
+
 **Step 4: Run test to verify it passes**
 
 Run: `cd backend && ./gradlew test --tests "com.blogplatform.auth.AuthServiceTest" -i`
-Expected: All 10 tests PASS.
+Expected: All 9 tests PASS.
 
 **Step 5: Commit**
 
 ```bash
-git add backend/src/main/java/com/blogplatform/auth/AuthService.java backend/src/test/java/com/blogplatform/auth/AuthServiceTest.java
-git commit -m "feat: add AuthService with register, authenticate, findById, brute-force protection, timing-safe lookup"
+git add backend/src/main/java/com/blogplatform/auth/AuthService.java backend/src/main/java/com/blogplatform/common/exception/AccountLockedException.java backend/src/test/java/com/blogplatform/auth/AuthServiceTest.java
+git commit -m "feat: add AuthService with register, lockout pre-check, login tracking, AccountLockedException (423)"
 ```
 
 ---
@@ -1068,6 +1107,35 @@ class AuthControllerTest {
     }
 
     @Test
+    void login_withLockedAccount_returns423() throws Exception {
+        // Register a user
+        var register = new RegisterRequest("lockuser", "lock@example.com", "Password1");
+        mockMvc.perform(post("/api/v1/auth/register")
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(register)));
+
+        // Fail login 5 times to trigger lockout
+        var badLogin = new LoginRequest("lockuser", "WrongPass1");
+        for (int i = 0; i < 5; i++) {
+            mockMvc.perform(post("/api/v1/auth/login")
+                    .with(csrf())
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(objectMapper.writeValueAsString(badLogin)));
+        }
+
+        // 6th attempt should return 423 Locked
+        mockMvc.perform(post("/api/v1/auth/login")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(badLogin)))
+                .andExpect(status().is(423))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(
+                        "Account temporarily locked due to too many failed attempts. Try again later."));
+    }
+
+    @Test
     void me_withoutAuth_returns401() throws Exception {
         mockMvc.perform(get("/api/v1/auth/me"))
                 .andExpect(status().isUnauthorized());
@@ -1091,22 +1159,18 @@ import com.blogplatform.auth.dto.LoginRequest;
 import com.blogplatform.auth.dto.RegisterRequest;
 import com.blogplatform.common.dto.ApiResponse;
 import com.blogplatform.user.UserAccount;
-import com.blogplatform.user.UserProfile;
-import com.blogplatform.user.UserRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.context.HttpSessionSecurityContextRepository;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
-
-import java.time.Instant;
 
 @RestController
 @RequestMapping("/api/v1/auth")
@@ -1114,14 +1178,11 @@ public class AuthController {
 
     private final AuthService authService;
     private final AuthenticationManager authenticationManager;
-    private final UserRepository userRepository;
 
     public AuthController(AuthService authService,
-                          AuthenticationManager authenticationManager,
-                          UserRepository userRepository) {
+                          AuthenticationManager authenticationManager) {
         this.authService = authService;
         this.authenticationManager = authenticationManager;
-        this.userRepository = userRepository;
     }
 
     @PostMapping("/register")
@@ -1132,32 +1193,37 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    @Transactional
     public ResponseEntity<ApiResponse<AuthResponse>> login(
             @Valid @RequestBody LoginRequest request, HttpServletRequest httpRequest) {
-        // AuthenticationManager delegates to CustomUserDetailsService + DaoAuthenticationProvider.
-        // This triggers session fixation protection (.newSession()) automatically.
-        Authentication authentication = authenticationManager.authenticate(
-                new UsernamePasswordAuthenticationToken(request.username(), request.password())
-        );
 
+        // 1. Pre-check: is the account locked? Throws 423 if so.
+        authService.checkLockout(request.username());
+
+        // 2. Authenticate via Spring Security's AuthenticationManager (single BCrypt path).
+        //    Delegates to CustomUserDetailsService → DaoAuthenticationProvider.
+        //    Triggers: session fixation protection, AuthenticationSuccessEvent,
+        //    and timing-safe user-not-found handling (hideUserNotFoundExceptions=true by default).
+        Authentication authentication;
+        try {
+            authentication = authenticationManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(request.username(), request.password())
+            );
+        } catch (BadCredentialsException ex) {
+            // 3a. On failure: record attempt with IP for anomaly detection
+            authService.recordLoginFailure(request.username(), httpRequest.getRemoteAddr());
+            throw new com.blogplatform.common.exception.UnauthorizedException("Invalid credentials");
+        }
+
+        // 3b. On success: store SecurityContext in session
         SecurityContext context = SecurityContextHolder.createEmptyContext();
         context.setAuthentication(authentication);
         SecurityContextHolder.setContext(context);
         httpRequest.getSession(true).setAttribute(
                 HttpSessionSecurityContextRepository.SPRING_SECURITY_CONTEXT_KEY, context);
 
-        // Extract user ID from authentication principal (set as username in UserDetailsService)
+        // 4. Record success: reset lockout counter, update login tracking (in transaction)
         Long userId = Long.valueOf(authentication.getName());
-        UserAccount user = authService.findById(userId);
-
-        // Update login tracking
-        UserProfile profile = user.getUserProfile();
-        if (profile != null) {
-            profile.setLastLogin(Instant.now());
-            profile.setLoginCount(profile.getLoginCount() + 1);
-            userRepository.save(user);
-        }
+        UserAccount user = authService.recordLoginSuccess(userId, request.username());
 
         return ResponseEntity.ok(ApiResponse.success(toAuthResponse(user), "Login successful"));
     }
@@ -1182,65 +1248,22 @@ public class AuthController {
 }
 ```
 
-Note: The `AuthenticationManager` bean from `SecurityConfig` delegates to `CustomUserDetailsService` via Spring Security's `DaoAuthenticationProvider`. The `authenticate()` call handles:
-- Password verification via BCrypt
-- Session fixation protection (new session created automatically)
-- `AuthenticationSuccessEvent` / `AuthenticationFailureBadCredentialsEvent` publishing
-
-However, because we also need brute-force protection (lockout checks + failure recording), the `AuthService.authenticate()` method is still called for the lockout pre-check. The login flow is:
-
-1. `AuthService` checks if account is locked (via `LoginAttemptService`)
-2. `AuthenticationManager.authenticate()` handles credential verification
-3. On success: `LoginAttemptService.resetFailures()`
-4. On failure: `LoginAttemptService.recordFailure()`
-
-Update `AuthController.login()` to integrate both:
-
-```java
-@PostMapping("/login")
-@Transactional
-public ResponseEntity<ApiResponse<AuthResponse>> login(
-        @Valid @RequestBody LoginRequest request, HttpServletRequest httpRequest) {
-
-    // Pre-check: is the account locked?
-    // This delegates to AuthService which checks LoginAttemptService
-    UserAccount user = authService.authenticate(request.username(), request.password());
-
-    // Now establish the Spring Security session via AuthenticationManager.
-    // Since AuthService already verified credentials, this will succeed.
-    // This triggers session fixation protection and event publishing.
-    Authentication authentication = authenticationManager.authenticate(
-            new UsernamePasswordAuthenticationToken(request.username(), request.password())
-    );
-
-    SecurityContext context = SecurityContextHolder.createEmptyContext();
-    context.setAuthentication(authentication);
-    SecurityContextHolder.setContext(context);
-    httpRequest.getSession(true).setAttribute(
-            HttpSessionSecurityContextRepository.SPRING_SECURITY_CONTEXT_KEY, context);
-
-    // Update login tracking
-    UserProfile profile = user.getUserProfile();
-    if (profile != null) {
-        profile.setLastLogin(Instant.now());
-        profile.setLoginCount(profile.getLoginCount() + 1);
-        userRepository.save(user);
-    }
-
-    return ResponseEntity.ok(ApiResponse.success(toAuthResponse(user), "Login successful"));
-}
-```
+**Login flow summary:**
+1. `authService.checkLockout(username)` — checks Redis lockout counter, throws `AccountLockedException` (423) if blocked
+2. `authenticationManager.authenticate()` — single BCrypt verification via `DaoAuthenticationProvider` + `CustomUserDetailsService`. Handles session fixation, event publishing, and timing-safe user-not-found (Spring's `hideUserNotFoundExceptions` performs a dummy BCrypt check automatically)
+3. On `BadCredentialsException`: record failure with IP via `authService.recordLoginFailure()`, throw `UnauthorizedException`
+4. On success: store `SecurityContext` in session, then `authService.recordLoginSuccess()` resets lockout counter and updates login tracking in a `@Transactional` method (safely loads lazy `UserProfile`)
 
 **Step 4: Run test to verify it passes**
 
 Run: `cd backend && ./gradlew test --tests "com.blogplatform.auth.AuthControllerTest" -i`
-Expected: All 5 tests PASS.
+Expected: All 6 tests PASS (including lockout integration test returning 423).
 
 **Step 5: Commit**
 
 ```bash
-git add backend/src/main/java/com/blogplatform/auth/ backend/src/test/java/com/blogplatform/auth/
-git commit -m "feat: add AuthController with register, login, logout, /me endpoints, login tracking"
+git add backend/src/main/java/com/blogplatform/auth/ backend/src/main/java/com/blogplatform/common/exception/AccountLockedException.java backend/src/test/java/com/blogplatform/auth/
+git commit -m "feat: add AuthController with register, login (unified auth path), logout, /me, lockout (423)"
 ```
 
 ---
