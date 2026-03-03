@@ -91,6 +91,7 @@ dependencies {
     testImplementation 'org.testcontainers:junit-jupiter'
     testImplementation 'org.testcontainers:postgresql'
     testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+    testImplementation 'com.redis:testcontainers-redis:2.2.4'
 }
 
 tasks.named('test') {
@@ -189,12 +190,12 @@ Create `backend/src/main/resources/application-prod.yml`:
 ```yaml
 spring:
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:blogplatform}
-    username: ${DB_USERNAME:blogplatform}
+    url: jdbc:postgresql://${DB_HOST}:5432/${DB_NAME}
+    username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
   data:
     redis:
-      host: ${REDIS_HOST:localhost}
+      host: ${REDIS_HOST}
       port: 6379
       password: ${REDIS_PASSWORD}
 
@@ -261,7 +262,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-devredispassword}", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=${REDIS_PASSWORD:-devredispassword} redis-cli ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -311,7 +312,7 @@ CREATE TABLE user_account (
     username VARCHAR(50) NOT NULL UNIQUE,
     email VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
-    role VARCHAR(20) NOT NULL DEFAULT 'USER',
+    role VARCHAR(20) NOT NULL DEFAULT 'USER' CHECK (role IN ('USER', 'AUTHOR', 'ADMIN')),
     is_vip BOOLEAN NOT NULL DEFAULT FALSE,
     vip_start_date TIMESTAMPTZ,
     vip_end_date TIMESTAMPTZ,
@@ -384,7 +385,7 @@ CREATE TABLE post_tags (
 -- PostUpdateLog
 CREATE TABLE post_update_log (
     log_id BIGSERIAL PRIMARY KEY,
-    post_id BIGINT NOT NULL REFERENCES blog_post(post_id),
+    post_id BIGINT NOT NULL REFERENCES blog_post(post_id) ON DELETE CASCADE,
     old_title VARCHAR(255),
     new_title VARCHAR(255),
     old_content TEXT,
@@ -561,7 +562,7 @@ BEGIN
     -- Strip inline code (`code`)
     clean_content := regexp_replace(clean_content, '`([^`]+)`', '\1', 'g');
     -- Strip code fences (```...```)
-    clean_content := regexp_replace(clean_content, '```[^`]*```', '', 'g');
+    clean_content := regexp_replace(clean_content, '```[\s\S]*?```', '', 'g');
     -- Strip links [text](url) → text
     clean_content := regexp_replace(clean_content, '\[([^\]]+)\]\([^)]+\)', '\1', 'g');
     -- Strip images ![alt](url)
@@ -721,6 +722,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -763,6 +765,12 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining(", "));
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(ApiResponse.error(errors));
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMalformedJson(HttpMessageNotReadableException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error("Malformed request body"));
     }
 
     @ExceptionHandler(Exception.class)
@@ -887,7 +895,8 @@ git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEnti
 | Version | Date | Changes |
 |---------|------|---------|
 | v1.0 | 2026-03-01 | Initial plan |
-| v1.1 | 2026-03-03 | Applied critical review fixes (see below) |
+| v1.1 | 2026-03-03 | Applied critical review 1 fixes (see below) |
+| v1.2 | 2026-03-03 | Applied critical review 2 fixes (see below) |
 
 ### v1.1 Changes (Critical Review 1)
 
@@ -907,3 +916,23 @@ git commit -m "feat: add common layer — ApiResponse, exceptions, CreatedAtEnti
 - **M7 — author_id naming clarity:** Added SQL comment explaining that `blog_post.author_id` references `user_account(account_id)`. (Task 3)
 
 **Review reference:** `docs/plans/2026-03-01-phase1a-project-setup-implementation-critical-review-1.md`
+
+### v1.2 Changes (Critical Review 2)
+
+**Critical fixes:**
+- **C1 — Unconstrained role column:** Added `CHECK (role IN ('USER', 'AUTHOR', 'ADMIN'))` constraint to `user_account.role` (Task 3)
+- **C2 — post_update_log FK blocks deletes:** Added `ON DELETE CASCADE` to `post_update_log.post_id` foreign key (Task 3)
+- **C3 — Multiline code fence regex broken:** Changed `'```[^`]*```'` to `'```[\s\S]*?```'` to match across newlines (Task 4)
+
+**Minor fixes:**
+- **M1 — Missing Redis Testcontainers dependency:** Added `com.redis:testcontainers-redis:2.2.4` to test dependencies (Task 1)
+- **M3 — Prod profile defaults mask misconfiguration:** Removed defaults for `DB_HOST`, `DB_NAME`, `DB_USERNAME`, `REDIS_HOST` in `application-prod.yml` so app fails fast on missing env vars (Task 1)
+- **M6 — Malformed JSON bypasses ApiResponse envelope:** Added `HttpMessageNotReadableException` handler returning 400 with `ApiResponse.error("Malformed request body")` (Task 5)
+- **M7 — Redis healthcheck exposes password:** Changed to `REDISCLI_AUTH` environment variable approach instead of `-a` flag (Task 2)
+
+**Skipped (no change needed):**
+- M2 — Comments are immutable by design (no `updated_at` needed)
+- M4 — `user_account.updated_at` is a scope expansion
+- M5 — `ApiResponse.error()` generic type is fine as-is
+
+**Review reference:** `docs/plans/2026-03-01-phase1a-project-setup-implementation-critical-review-2.md`
