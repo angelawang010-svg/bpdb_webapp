@@ -1,0 +1,25 @@
+spring:
+  application:
+    name: blog-platform
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  session:
+    store-type: redis
+    timeout: 30m
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 10MB
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
