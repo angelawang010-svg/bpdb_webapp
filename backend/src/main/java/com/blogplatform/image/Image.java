@@ -19,7 +19,7 @@ public class Image {
     @JoinColumn(name = "post_id", nullable = false)
     private BlogPost post;
 
-    @Size(max = 255)
+    @Size(max = 500)
     @Pattern(regexp = "^/uploads/.*", message = "Image URL must be a server upload path")
     @Column(name = "image_url", nullable = false, length = 500)
     private String imageUrl;
