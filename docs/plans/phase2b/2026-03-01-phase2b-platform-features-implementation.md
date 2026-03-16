@@ -1,8 +1,8 @@
 # Phase 2B: Platform Features — Implementation Plan
 
-**Version:** 4.0
+**Version:** 5.0
 
-(Part 2 of 2 — Tasks 11-22 of 22)
+(Part 2 of 2 — Tasks 11-22 of 21)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -14,11 +14,11 @@
 
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — Sections 5 (API Endpoints), 6 (Business Logic Migration), and 8 (Testing Strategy).
 
-**Prerequisite:** Phase 2A (Tasks 1-10) must be complete, including Task 5 (save/unsave post endpoints).
+**Prerequisite:** Phase 2A (Tasks 1-9) must be complete, including Task 5 (save/unsave post endpoints).
 
 ## Phase 2 Parts
 
-- **Phase 2A** (`2026-03-01-phase2a-content-crud-implementation.md`): Tasks 1–10 — Category, Tag, Post CRUD, Comments, Likes, Authors
+- **Phase 2A** (`2026-03-01-phase2a-content-crud-implementation.md`): Tasks 1–9 — Category, Tag, Post CRUD, Comments, Likes, Authors
 - **Phase 2B** (this file): Tasks 11–22 — Email Service, Subscriptions, Notifications, Profiles, Password Reset, Email Verification, Image Upload, VIP Stub, Admin, Cleanup, OpenAPI, Integration Tests
 
 ---
@@ -66,22 +66,16 @@ git commit -m "feat: add Subscription subscribe/unsubscribe"
 - Create: `backend/src/main/java/com/blogplatform/notification/NotificationService.java`
 - Create: `backend/src/main/java/com/blogplatform/notification/NotificationController.java`
 - Create: `backend/src/main/java/com/blogplatform/notification/dto/NotificationResponse.java`
-- Create: `backend/src/main/java/com/blogplatform/notification/event/NewPostEvent.java`
+- Reuse: `backend/src/main/java/com/blogplatform/post/NewPostEvent.java` (from Phase 2A Task 4)
 - Create: `backend/src/test/java/com/blogplatform/notification/NotificationServiceTest.java`
 - Create: `backend/src/test/java/com/blogplatform/notification/NotificationControllerIT.java`
 - Modify: `backend/src/main/java/com/blogplatform/post/PostService.java` — publish `NewPostEvent` via `ApplicationEventPublisher`
 
-**Step 1: Define NewPostEvent**
+**Step 1: Reuse NewPostEvent from Phase 2A**
 
+`NewPostEvent` is already defined in `com.blogplatform.post.NewPostEvent` (Phase 2A Task 4) and already wired into `PostService.createPost()` via `ApplicationEventPublisher`. Do NOT create a duplicate event class. Import the existing one:
 ```java
-package com.blogplatform.notification.event;
-
-public record NewPostEvent(Long postId, String title, String authorName) {}
-```
-
-Wire into `PostService.createPost()`:
-```java
-applicationEventPublisher.publishEvent(new NewPostEvent(post.getId(), post.getTitle(), author.getDisplayName()));
+import com.blogplatform.post.NewPostEvent;
 ```
 
 **Step 2: Write failing unit tests — SP_Create_Post_Notifications business rules**
@@ -631,6 +625,7 @@ public class ScheduledJobs {
     private final ReadPostRepository readPostRepository;
     private final PasswordResetTokenRepository passwordResetTokenRepository;
     private final EmailVerificationTokenRepository emailVerificationTokenRepository;
+    private final PostUpdateLogRepository postUpdateLogRepository;
 
     @Scheduled(cron = "0 0 2 * * *") // Daily at 2 AM
     public void cleanupOldNotifications() {
@@ -664,6 +659,13 @@ public class ScheduledJobs {
         log.info("Cleaned up {} expired password reset tokens and {} expired email verification tokens",
                 pwDeleted, evDeleted);
     }
+
+    @Scheduled(cron = "0 0 4 * * *") // Daily at 4 AM
+    public void nullifyOldAuditForensicFields() {
+        Instant cutoff = Instant.now().minus(Duration.ofDays(90));
+        int updated = postUpdateLogRepository.nullifyForensicFieldsOlderThan(cutoff);
+        log.info("Nullified forensic fields on {} audit log entries older than 90 days", updated);
+    }
 }
 ```
 
@@ -672,6 +674,7 @@ Add batched native delete queries to repositories (PostgreSQL-compatible syntax)
 - `ReadPostRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM read_post WHERE id IN (SELECT id FROM read_post WHERE read_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
 - `PasswordResetTokenRepository`: `@Modifying @Query("DELETE FROM PasswordResetToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
 - `EmailVerificationTokenRepository`: `@Modifying @Query("DELETE FROM EmailVerificationToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
+- `PostUpdateLogRepository`: `@Modifying @Query("UPDATE PostUpdateLog l SET l.ipAddress = NULL, l.userAgent = NULL WHERE l.ipAddress IS NOT NULL AND l.createdAt < :cutoff")` — nullifies forensic fields (ip_address, user_agent) per 90-day retention policy defined in Phase 2A Task 4
 
 Note: Uses `DELETE ... WHERE id IN (SELECT id ... LIMIT)` subquery for PostgreSQL compatibility (PostgreSQL does not support `LIMIT` directly on `DELETE`).
 
@@ -805,7 +808,7 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 - Image upload (Tika validation, MIME allowlist, dimension limits, per-user quota, UUID filenames)
 - VIP upgrade stub (501)
 - Admin endpoints (deleted posts, restore, role assignment with last-admin guard)
-- SpringDoc OpenAPI with Bearer JWT security scheme
+- SpringDoc OpenAPI with session-based auth documentation
 - Full integration test suite covering subscriptions and notifications
 
 **Next plan:** Phase 3 (Front-End — React + TypeScript SPA)
@@ -813,6 +816,13 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 ---
 
 ## Changelog
+
+### v5.0 (2026-03-15) — Per cross-plan consistency review
+
+- **Header:** Fixed task total from 22 to 21 (Task 10 was removed in 2B v2.0 but total was never updated). Fixed prerequisite from "Tasks 1-10" to "Tasks 1-9". Fixed Phase 2A cross-reference from "Tasks 1–10" to "Tasks 1–9".
+- **Task 12:** Removed duplicate `NewPostEvent` definition — reuse existing `com.blogplatform.post.NewPostEvent` from Phase 2A Task 4. Removed file creation entry, updated Step 1 to import existing class.
+- **Task 20:** Added `nullifyOldAuditForensicFields()` scheduled job (daily at 4 AM) to nullify `ip_address` and `user_agent` on `post_update_log` entries older than 90 days, fulfilling the retention policy defined in Phase 2A Task 4. Added `PostUpdateLogRepository` dependency and query.
+- **Summary:** Fixed stale "Bearer JWT" reference to "session-based auth documentation".
 
 ### v4.0 (2026-03-15) — Per security-audit-1
 
