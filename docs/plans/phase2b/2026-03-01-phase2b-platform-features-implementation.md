@@ -1,6 +1,6 @@
 # Phase 2B: Platform Features — Implementation Plan
 
-**Version:** 2.0
+**Version:** 3.0
 
 (Part 2 of 2 — Tasks 11-22 of 22)
 
@@ -10,7 +10,7 @@
 
 **Architecture:** Builds on Phase 1 foundation. Each feature follows the package-by-feature layout: Entity → Repository → Service → Controller → DTOs. All endpoints under `/api/v1/`. TDD throughout.
 
-**Tech Stack:** Same as Phase 1. Additionally: Apache Tika (image validation), `@Async` + `@TransactionalEventListener` (notifications), `@Scheduled` (cleanup jobs), Spring Retry (notification resilience).
+**Tech Stack:** Same as Phase 1. Additionally: Apache Tika (image validation), `@Async` + `@TransactionalEventListener` (notifications), `@Scheduled` (cleanup jobs), Spring Retry (notification resilience), Awaitility (async test assertions).
 
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — Sections 5 (API Endpoints), 6 (Business Logic Migration), and 8 (Testing Strategy).
 
@@ -42,7 +42,7 @@
 
 `SubscriberRepository`:
 - `findByAccount_Id(Long)` → Optional
-- `findAllActiveSubscribers(Pageable)` — `@Query("SELECT s FROM Subscriber s JOIN FETCH s.account WHERE s.expirationDate IS NULL OR s.expirationDate > :now")`
+- `findAllActiveSubscribers(@Param("now") Instant now, Pageable pageable)` — `@Query("SELECT s FROM Subscriber s JOIN FETCH s.account WHERE s.expirationDate IS NULL OR s.expirationDate > :now")`
 - `existsByAccount_Id(Long)`
 
 `SubscriptionController`:
@@ -115,11 +115,11 @@ void notifySubscribers_retriesOnTransientFailure() {
 
 **Step 3: Implement NotificationService**
 
-Key: `notifySubscribers()` method with batched processing and retry:
+Key: Separate event dispatch from per-batch retry to avoid duplicate notifications on partial failure.
+
+**Dispatcher method** (thin — handles event listening and batch loop):
 ```java
 @Async
-@Retryable(maxAttempts = 3, backoff = @Backoff(delay = 1000, multiplier = 2),
-           retryFor = DataAccessException.class)
 @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
 public void notifySubscribers(NewPostEvent event) {
     int batchSize = 500;
@@ -129,26 +129,39 @@ public void notifySubscribers(NewPostEvent event) {
                 Instant.now(), PageRequest.of(page, batchSize));
         if (subscribers.isEmpty()) break;
 
-        List<Notification> notifications = subscribers.stream()
-                .map(sub -> {
-                    Notification n = new Notification();
-                    n.setAccount(sub.getAccount());
-                    n.setMessage("New post: " + event.title() + " by " + event.authorName());
-                    return n;
-                })
-                .toList();
-        notificationRepository.saveAll(notifications);
+        processNotificationBatch(event, subscribers.getContent());
         page++;
     }
 }
+```
+
+**Per-batch retry method** (retry scoped to a single batch — no duplicate notifications):
+```java
+@Retryable(maxAttempts = 3, backoff = @Backoff(delay = 1000, multiplier = 2),
+           retryFor = DataAccessException.class)
+public void processNotificationBatch(NewPostEvent event, List<Subscriber> subscribers) {
+    List<Notification> notifications = subscribers.stream()
+            .map(sub -> {
+                Notification n = new Notification();
+                n.setAccount(sub.getAccount());
+                n.setMessage("New post: " + event.title() + " by " + event.authorName());
+                return n;
+            })
+            .toList();
+    notificationRepository.saveAll(notifications);
+}
 
 @Recover
-public void notifySubscribersFallback(DataAccessException e, NewPostEvent event) {
-    log.error("All retries exhausted for post {} notification. Manual intervention required.",
-            event.postId(), e);
+public void processNotificationBatchFallback(DataAccessException e, NewPostEvent event, List<Subscriber> subscribers) {
+    log.error("All retries exhausted for post {} notification batch ({} subscribers). Manual intervention required.",
+            event.postId(), subscribers.size(), e);
     // TODO: Persist to dead-letter table for reprocessing
 }
 ```
+
+**Important implementation notes:**
+- `processNotificationBatch()` MUST be on a separate Spring bean (or self-injected) for `@Retryable` AOP proxy to work — calling it directly from the same class bypasses the proxy.
+- Verify that `PostService.createPost()` is `@Transactional` — otherwise `@TransactionalEventListener` fires immediately with no transaction to listen to.
 
 Also implement:
 - `markAsRead(Long notificationId, Long accountId)` — with ownership check
@@ -331,6 +344,11 @@ void resetPassword_usedToken_throwsBadRequest() {
 void resetPassword_unverifiedEmail_throwsBadRequest() {
     // email_verified = false → cannot reset password
 }
+
+@Test
+void forgotPassword_exceedsRateLimit_returns200ButNoTokenCreated() {
+    // 3 tokens already created in last hour → returns 200 (constant-time) but no new token/email
+}
 ```
 
 **Step 3: Implement**
@@ -342,6 +360,7 @@ Token spec per design doc:
 - 30-minute expiry
 - Single-use (`used` boolean)
 - Constant-time response (always 200 on forgot-password regardless of email existence)
+- **Rate limiting:** Maximum 3 forgot-password requests per account per hour. In `AuthService.forgotPassword()`, check `passwordResetTokenRepository.countByAccountAndCreatedAtAfter(account, Instant.now().minus(Duration.ofHours(1)))` — reject with 200 (same constant-time response) if >= 3. Production deployment should add IP-based rate limiting at the reverse proxy layer (nginx/CloudFlare).
 
 Email sending: uses `EmailService` interface (implemented in Task 14).
 
@@ -477,7 +496,7 @@ void upload_exceedsMaxDimensions_throwsBadRequest() {
 Key logic:
 - **Allowlisted MIME types only:** JPEG (`image/jpeg`), PNG (`image/png`), GIF (`image/gif`), WebP (`image/webp`). **Reject SVG** — it can contain embedded JavaScript.
 - Validate Content-Type header AND magic bytes via Apache Tika
-- **Decompression bomb protection:** Use `ImageIO.read()` to decode and check dimensions. Reject images exceeding 10000x10000 pixels. Catch `OutOfMemoryError` in the decode path.
+- **Decompression bomb protection:** Use `ImageIO.createImageInputStream()` + `ImageReader.getWidth(0)/getHeight(0)` to read dimensions from image headers **without decoding the full bitmap** into memory. Reject images exceeding 10000x10000 pixels. Do NOT use `ImageIO.read()` — a 10000x10000 RGBA image would allocate ~400MB of heap.
 - Generate UUID-based filename: `{uuid}.{ext}`
 - Save to configurable upload directory (default: `./uploads/`)
 - Track cumulative size per user (query sum of file sizes or maintain counter)
@@ -485,7 +504,7 @@ Key logic:
 
 `ImageController`:
 - `POST /api/v1/posts/{postId}/images` — AUTHOR or ADMIN, multipart upload
-- `GET /api/v1/images/{id}` — serves image with `Content-Disposition: inline`, `X-Content-Type-Options: nosniff`, and `Cache-Control` headers. Do NOT serve the upload directory as a static resource — always proxy through this controller.
+- `GET /api/v1/images/{id}` — serves image with `Content-Disposition: inline`, `Content-Length`, `X-Content-Type-Options: nosniff`, and `Cache-Control` headers. Do NOT serve the upload directory as a static resource — always proxy through this controller.
 - `DELETE /api/v1/images/{id}` — owner or admin
 
 <!-- TODO: Add ClamAV/antivirus scanning integration for production deployment (Phase 4+) -->
@@ -556,7 +575,7 @@ git commit -m "feat: add VIP upgrade stub returning 501"
 
 **Step 2: Implement AdminController + AdminService**
 
-Admin controller disables the Hibernate `activePostsFilter` to query soft-deleted posts. Uses `EntityManager` to control the filter.
+Admin controller queries soft-deleted posts using an explicit `@Query("SELECT p FROM Post p WHERE p.isDeleted = true")` on the repository — do NOT toggle the Hibernate `activePostsFilter` via `EntityManager`, as filters are session-scoped and disabling one affects all queries in the same session/request (unpredictable side effects with OpenSessionInView or shared sessions).
 
 **Last-admin guard:** `AdminService.assignRole()` must check: if the target user is currently ADMIN and the new role is not ADMIN, query `userRepository.countByRole(Role.ADMIN)`. If count <= 1, throw `409 Conflict` with message "Cannot demote the last admin account."
 
@@ -570,7 +589,7 @@ git commit -m "feat: add Admin endpoints for deleted posts, restore, and role as
 
 ---
 
-### Task 20: Scheduled Cleanup Jobs — Notifications + ReadPost Retention
+### Task 20: Scheduled Cleanup Jobs — Notifications, ReadPost, and Token Retention
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/config/ScheduledJobs.java`
@@ -581,16 +600,23 @@ git commit -m "feat: add Admin endpoints for deleted posts, restore, and role as
 ```java
 @Test
 void cleanupOldNotifications_deletesReadNotificationsOlderThan90Days() {
-    // Verify repository.deleteReadNotificationsOlderThan(90 days ago) called
+    // Verify repository.deleteReadNotificationsOlderThanBatch(90 days ago, batchSize) called in loop
 }
 
 @Test
 void cleanupOldReadPosts_deletesEntriesOlderThan1Year() {
-    // Verify readPostRepository.deleteOlderThan(1 year ago) called
+    // Verify readPostRepository.deleteOlderThanBatch(1 year ago, batchSize) called in loop
+}
+
+@Test
+void cleanupExpiredTokens_deletesExpiredAndUsedTokensOlderThan7Days() {
+    // Verify both token repositories called with 7-day cutoff
 }
 ```
 
 **Step 2: Implement**
+
+**Important:** Do NOT annotate `@Scheduled` methods with `@Transactional` — the batch loop must commit each batch independently. Instead, annotate the repository batch-delete methods with `@Transactional(propagation = Propagation.REQUIRES_NEW)` so each batch runs in its own transaction. This prevents long-held locks across potentially millions of rows.
 
 ```java
 @Configuration
@@ -602,9 +628,10 @@ public class ScheduledJobs {
 
     private final NotificationRepository notificationRepository;
     private final ReadPostRepository readPostRepository;
+    private final PasswordResetTokenRepository passwordResetTokenRepository;
+    private final EmailVerificationTokenRepository emailVerificationTokenRepository;
 
     @Scheduled(cron = "0 0 2 * * *") // Daily at 2 AM
-    @Transactional
     public void cleanupOldNotifications() {
         Instant cutoff = Instant.now().minus(Duration.ofDays(90));
         int totalDeleted = 0;
@@ -617,7 +644,6 @@ public class ScheduledJobs {
     }
 
     @Scheduled(cron = "0 0 3 * * *") // Daily at 3 AM
-    @Transactional
     public void cleanupOldReadPosts() {
         Instant cutoff = Instant.now().minus(Duration.ofDays(365));
         int totalDeleted = 0;
@@ -628,14 +654,25 @@ public class ScheduledJobs {
         } while (deleted == DELETE_BATCH_SIZE);
         log.info("Cleaned up {} old read post entries", totalDeleted);
     }
+
+    @Scheduled(cron = "0 30 2 * * *") // Daily at 2:30 AM
+    public void cleanupExpiredTokens() {
+        Instant cutoff = Instant.now().minus(Duration.ofDays(7));
+        int pwDeleted = passwordResetTokenRepository.deleteExpiredOrUsedOlderThan(cutoff);
+        int evDeleted = emailVerificationTokenRepository.deleteExpiredOrUsedOlderThan(cutoff);
+        log.info("Cleaned up {} expired password reset tokens and {} expired email verification tokens",
+                pwDeleted, evDeleted);
+    }
 }
 ```
 
-Add batched native delete queries to repositories:
-- `NotificationRepository`: `@Modifying @Query(value = "DELETE FROM notification WHERE is_read = true AND created_at < :cutoff LIMIT :batchSize", nativeQuery = true)`
-- `ReadPostRepository`: `@Modifying @Query(value = "DELETE FROM read_post WHERE read_at < :cutoff LIMIT :batchSize", nativeQuery = true)`
+Add batched native delete queries to repositories (PostgreSQL-compatible syntax):
+- `NotificationRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM notification WHERE id IN (SELECT id FROM notification WHERE is_read = true AND created_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
+- `ReadPostRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM read_post WHERE id IN (SELECT id FROM read_post WHERE read_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
+- `PasswordResetTokenRepository`: `@Modifying @Query("DELETE FROM PasswordResetToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
+- `EmailVerificationTokenRepository`: `@Modifying @Query("DELETE FROM EmailVerificationToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
 
-Note: Uses native queries with `LIMIT` since JPQL does not support limit on delete. For PostgreSQL, use `DELETE FROM ... WHERE ctid IN (SELECT ctid FROM ... WHERE ... LIMIT :batchSize)` syntax.
+Note: Uses `DELETE ... WHERE id IN (SELECT id ... LIMIT)` subquery for PostgreSQL compatibility (PostgreSQL does not support `LIMIT` directly on `DELETE`).
 
 **Step 3: Run tests, verify pass**
 
@@ -714,7 +751,8 @@ void fullPostFlow_create_read_comment_like_save_delete_restore() throws Exceptio
     // 2. Login as AUTHOR, create post
     // 3. Verify post appears in listing
     // 4. Login as USER, subscribe (POST /subscriptions)
-    // 5. Verify notification created for subscriber after post creation
+    // 5. Verify notification created for subscriber after post creation (use Awaitility — notification is @Async)
+    //    await().atMost(5, SECONDS).until(() -> notificationRepository.countByAccountId(subscriberId) > 0);
     // 6. Read post (GET /posts/{id})
     // 7. Comment on post
     // 8. Reply to comment
@@ -758,6 +796,7 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 - Async notification system (SP_Create_Post_Notifications migration) with retry and batching
 - Notification retention (90-day batched cleanup for read)
 - ReadPost retention (1-year batched cleanup)
+- Token retention (7-day cleanup for expired/used password reset and email verification tokens)
 - User profile endpoints + saved posts listing
 - Email service interface with dev logging
 - Password reset (secure token flow with defined entity schema)
@@ -773,6 +812,16 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 ---
 
 ## Changelog
+
+### v3.0 (2026-03-15) — Per critical-review-2
+
+- **Task 11:** Added `@Param("now") Instant now` parameter to `findAllActiveSubscribers()` — Spring Data JPA requires explicit `@Param` for `:now` in `@Query`.
+- **Task 12:** Split `notifySubscribers()` into dispatcher + per-batch retry. The `@TransactionalEventListener` + `@Async` dispatcher loops batches and calls a separate `@Retryable` method per batch. This prevents duplicate notifications on partial failure (previously, retry re-executed all batches including already-succeeded ones). Added implementation note that `processNotificationBatch()` must be on a separate bean for AOP proxy to work. Added note to verify `PostService.createPost()` is `@Transactional`.
+- **Task 15:** Added rate limiting on forgot-password — max 3 requests per account per hour via DB count check. Returns 200 (constant-time) even when rate-limited. Added test case. Added note for production IP-based rate limiting at reverse proxy layer.
+- **Task 17:** Replaced `ImageIO.read()` with `ImageIO.createImageInputStream()` + `ImageReader.getWidth()/getHeight()` for dimension checks — reads headers only, avoids decoding full bitmap into memory (~400MB for max-size images). Added `Content-Length` header to image serving endpoint.
+- **Task 19:** Replaced Hibernate filter toggling with explicit `@Query("... WHERE p.isDeleted = true")` — filters are session-scoped and toggling them affects all queries in the same request.
+- **Task 20:** Removed `@Transactional` from `@Scheduled` methods — wrapping the entire batch loop in one transaction defeats batching by holding locks across all iterations. Repository batch-delete methods now use `@Transactional(propagation = Propagation.REQUIRES_NEW)` for independent commits per batch. Fixed native delete queries to PostgreSQL-compatible `DELETE ... WHERE id IN (SELECT id ... LIMIT)` syntax (PostgreSQL doesn't support `LIMIT` on `DELETE`). Added `cleanupExpiredTokens()` job (daily at 2:30 AM) for expired/used `PasswordResetToken` and `EmailVerificationToken` rows older than 7 days.
+- **Task 22:** Added `Awaitility` usage note for async notification assertion — `@Async` notification handler may not complete before assertion runs. Added Awaitility to tech stack.
 
 ### v2.0 (2026-03-15) — Per critical-review-1
 
