@@ -29,7 +29,7 @@ These conventions apply to every task in this plan:
 - **Test isolation:** All `*IT` classes are annotated with `@Transactional` for automatic rollback between tests, preventing inter-test data leakage.
 - **Concurrency safety on unique constraints:** Any service method that checks uniqueness before saving (e.g., `existsByName` → `save`) must also catch `DataIntegrityViolationException` and translate it to `BadRequestException`. The pre-check provides fast user feedback; the catch guards against TOCTOU races.
 - **DTO mapping:** All response DTOs provide a static `from()` factory method for entity-to-DTO conversion (e.g., `CategoryResponse.from(Category c)`). Controllers use this instead of inline `new ResponseDto(...)` calls.
-- **Content contract:** All content fields (post content, comment content) store raw Markdown. Frontends MUST use a safe Markdown renderer that escapes raw HTML (no HTML passthrough). The backend does not sanitize HTML — server-side sanitization would mangle Markdown syntax. Defense against XSS is the renderer's responsibility.
+- **Content contract — server-side sanitization (SECURITY):** All content fields (post content, comment content) store raw Markdown. The backend renders Markdown to HTML using commonmark-java and sanitizes the output with OWASP Java HTML Sanitizer (allowlist policy: standard formatting tags, links, images, code blocks — no `<script>`, `<iframe>`, event handlers, `javascript:` URIs). Content responses include both `contentRaw` (original Markdown for editing) and `contentHtml` (sanitized HTML for display). This is a **security-critical path** — all content must flow through `MarkdownSanitizer.sanitize()` before inclusion in any response DTO. See Task 4 for implementation details.
 - **Hibernate soft-delete filter activation:** `PostService` methods that should exclude deleted posts (`listPosts()`, `getPost()`, search methods) must explicitly enable the Hibernate `deletedFilter` before executing queries. Admin methods (restore, list deleted) must NOT enable it. Pattern:
   ```java
   private void enableDeletedFilter() {
@@ -39,7 +39,7 @@ These conventions apply to every task in this plan:
   ```
   `PostService` requires an injected `EntityManager` for this purpose.
 - **Authentication-aware public endpoints:** Public endpoints that perform user-specific side effects (e.g., `getPost()` calling `markAsRead()`) must guard those side effects with an authentication null-check. Pass `Authentication` (nullable) from the controller. When null/anonymous: skip `markAsRead()`, block premium posts with 403.
-- **Per-endpoint rate limiting:** Deferred to a future phase. The global `RateLimitFilter` provides baseline protection for now. Spam-sensitive endpoints (comments, likes) may need tighter per-endpoint limits later.
+- **Per-endpoint rate limiting (SECURITY):** Extend the existing `RateLimitFilter` with tighter per-endpoint limits for spam-sensitive endpoints. Limits: comment creation (`POST /api/v1/posts/*/comments`): 10 req/min per user; like/unlike (`POST|DELETE /api/v1/posts/*/likes`): 30 req/min per user. Add these as additional tiers in the existing Caffeine-based filter alongside the current auth/anonymous tiers. See Task 7 (CommentController) and Task 8 (LikeController) for integration points.
 
 ---
 
@@ -584,7 +584,8 @@ git commit -m "feat: add Post DTOs and repositories with custom queries"
 - Create: `backend/src/main/java/com/blogplatform/post/NewPostEvent.java`
 - Create: `backend/src/main/java/com/blogplatform/post/PostService.java`
 - Create: `backend/src/test/java/com/blogplatform/post/PostServiceTest.java`
-- Create: `backend/src/main/resources/db/migration/V3__add_audit_updated_by.sql` — adds `updated_by BIGINT REFERENCES user_account(account_id)` to `post_update_log` table
+- Create: `backend/src/main/resources/db/migration/V3__add_audit_updated_by.sql` — adds `updated_by BIGINT REFERENCES user_account(account_id)`, `ip_address VARCHAR(45)`, and `user_agent VARCHAR(500)` to `post_update_log` table (IP/user-agent for forensic audit trail; subject to 90-day retention policy — cleanup job in Phase 2B)
+- Create: `backend/src/main/java/com/blogplatform/common/security/MarkdownSanitizer.java`
 
 **Step 1: Write failing unit tests**
 
@@ -621,7 +622,9 @@ public record NewPostEvent(Long postId, String title, String authorName) {}
 - `getPost(Long postId, Authentication auth)`: calls `enableDeletedFilter()`, checks `is_deleted`, checks premium access (VIP, post author, and ADMIN are all exempt; anonymous users get 403 on premium posts). If `auth` is non-null and authenticated (not `AnonymousAuthenticationToken`), calls `readPostRepository.markAsRead(userId, postId)` (idempotent native upsert). If `auth` is null/anonymous, skips read tracking.
 - `listPosts()`: calls `enableDeletedFilter()` to exclude deleted posts, supports pagination, category/tag/author filtering, full-text search
 
-> **Note on audit logging:** All audit logging (both create and update) is handled in PostService. There is no `@PostPersist` entity listener — this avoids the static injection anti-pattern and keeps audit responsibility in one place.
+> **Note on MarkdownSanitizer:** Create `MarkdownSanitizer` as a `@Component` wrapping commonmark-java (Markdown → HTML) + OWASP Java HTML Sanitizer (HTML → safe HTML). Single method: `String sanitize(String rawMarkdown)`. Use an allowlist policy permitting: `<p>`, `<h1>`–`<h6>`, `<ul>`, `<ol>`, `<li>`, `<a href>` (http/https only), `<img src alt>`, `<code>`, `<pre>`, `<blockquote>`, `<em>`, `<strong>`, `<br>`, `<hr>`, `<table>`, `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>`. All other tags/attributes are stripped. `PostDetailResponse` and `CommentResponse` include both `contentRaw` and `contentHtml` fields. Add unit tests: verify script tags stripped, javascript: URIs stripped, legitimate Markdown rendered correctly.
+
+> **Note on audit logging:** All audit logging (both create and update) is handled in PostService. There is no `@PostPersist` entity listener — this avoids the static injection anti-pattern and keeps audit responsibility in one place. Audit log entries include `ip_address` and `user_agent` populated from `HttpServletRequest` via `RequestContextHolder.getRequestAttributes()`. These fields support incident forensics (e.g., distinguishing compromised account activity). IP/user-agent data is subject to a 90-day retention policy (nulled out by a scheduled cleanup job in Phase 2B).
 
 > **Note on premium access:** The premium check in `getPost()` exempts three cases: (1) the post's own author, (2) users with ADMIN role, (3) users with VIP status. All others receive 403 Forbidden. List endpoints (`listPosts()`) include premium posts in results with the `isPremium` flag set — the `PostListResponse` does not contain full content, so no content is leaked.
 
@@ -646,7 +649,7 @@ git commit -m "feat: add PostService with CRUD, soft delete, audit logging, read
 Key tests:
 - `GET /api/v1/posts` — public, returns paginated list with seed data
 - `GET /api/v1/posts?category=1` — filter by category
-- `GET /api/v1/posts?search=keyword` — full-text search
+- `GET /api/v1/posts?search=keyword` — full-text search (search param validated with `@Size(max = 200)`)
 - `POST /api/v1/posts` — AUTHOR role creates post, returns 201
 - `POST /api/v1/posts` — USER role returns 403
 - `PUT /api/v1/posts/{id}` — owner updates, verify PostUpdateLog written
@@ -661,7 +664,7 @@ Key tests:
 **Step 2: Implement PostController**
 
 Endpoints per design doc Section 5:
-- `GET /api/v1/posts` — public, paginated, filterable
+- `GET /api/v1/posts` — public, paginated, filterable. Search query parameter: `@RequestParam @Size(max = 200) String search`. Add code comment on `searchByText` repository method documenting that `plainto_tsquery` is intentional for safety (strips tsquery operators, preventing injection).
 - `GET /api/v1/posts/{id}` — public (premium → VIP/author/admin only), marks as read
 - `POST /api/v1/posts` — `@PreAuthorize("hasAnyRole('AUTHOR', 'ADMIN')")`
 - `PUT /api/v1/posts/{id}` — load post via service, call `ownershipVerifier.verify(post.getAuthor().getAccountId(), authentication)`, then proceed with update
@@ -778,13 +781,14 @@ git commit -m "feat: add CommentService with threading, read-before-comment, dep
 
 **Step 1: Write integration tests**
 
-- `GET /api/v1/posts/{id}/comments` — public, returns threaded structure, **paginated by top-level comments** (default page size 20)
+- `GET /api/v1/posts/{id}/comments` — public, returns threaded structure, **paginated by top-level comments** (default page size 20). **Must verify post exists and is not soft-deleted** before returning comments (prevents information disclosure for deleted posts — return 404 if post is deleted).
 - `POST /api/v1/posts/{id}/comments` — authenticated, must have read post
 - `POST comment without reading post` — 403
 - `DELETE /api/v1/comments/{id}` — owner soft-deletes (content blanked, `is_deleted = true`, row preserved for thread structure)
 - `DELETE /api/v1/comments/{id}` — non-owner returns 403
 - `DELETE /api/v1/comments/{id}` — admin can soft-delete any comment
 - `GET comments after delete` — deleted comment with replies shows as `"[deleted]"` placeholder; deleted comment without replies is hidden from response
+- `GET /api/v1/posts/{id}/comments` where post is soft-deleted — returns 404 (prevents information disclosure)
 - Full thread flow: create post → read it → comment → reply → verify nesting
 
 **Step 2: Implement CommentController**
@@ -918,3 +922,4 @@ git commit -m "feat: add Author profile listing with post counts"
 | 1.0 | 2026-03-01 | Initial plan with Tasks 1-10 |
 | 2.0 | 2026-03-15 | Revised per critical review (`2026-03-01-phase2a-content-crud-implementation-critical-review-1.md`). Changes: (1) Removed Task 5 (PostEntityListener) — creation audit logging moved into Task 4 PostService to avoid static injection anti-pattern and keep audit in one place. Tasks renumbered 1-9. (2) Added `ReadPostRepository.markAsRead()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`) in Task 3 to prevent duplicate insert errors on re-view. (3) Added `DataIntegrityViolationException` catch on all uniqueness-checked operations (Tasks 1, 2) as TOCTOU race guard. (4) Added `existsByCategoryNameAndCategoryIdNot` duplicate name check on Category update (Task 1). (5) Specified single-query + in-memory tree assembly for comment threading (Task 7) to prevent N+1 queries. (6) Added top-level comment pagination to `GET /api/v1/posts/{id}/comments` (Task 7). (7) Replaced ambiguous re-parenting prose with explicit depth algorithm and concrete A→B→C→D example (Task 6). (8) Added explicit `ownershipVerifier.verify()` calls for post update/delete (Task 5) and comment delete (Task 7) with IDOR prevention tests. (9) Added premium access exemptions for post author and ADMIN role (Task 4). (10) Added Cross-Cutting Conventions section: `@Slf4j` logging, `@Transactional(readOnly=true)`, extend `BaseIntegrationTest`, `@Transactional` on IT classes, `DataIntegrityViolationException` catch pattern. (11) Added explicit Tag unit tests (Task 2). (12) Documented PUT = full-replacement semantics for Category and Post updates. Phase 2B task numbers shifted (now Tasks 10-22). |
 | 3.0 | 2026-03-15 | Revised per critical review v2 (`2026-03-01-phase2a-content-crud-implementation-critical-review-2.md`). Changes: (1) Changed comment deletion from hard delete to soft delete with "[deleted]" placeholder — preserves thread structure and other users' replies. Added Flyway migration `V4__add_comment_is_deleted.sql`. Corrected false claim that schema has `ON DELETE CASCADE` on `parent_comment_id` (it uses default RESTRICT). (2) Added `DataIntegrityViolationException` catch on `CategoryService.delete()` to handle FK violation when category has referencing posts — returns 400 with clear message. (3) Added Hibernate `deletedFilter` activation pattern to cross-cutting conventions with `enableDeletedFilter()` helper method using injected `EntityManager`. Specified which `PostService` methods enable the filter and which don't (admin restore). (4) Added `findByIdWithParentChain` JOIN FETCH query to `CommentRepository` — loads full parent chain (max depth 3) in one query, preventing N+1 lazy loads during depth calculation. (5) Made `getPost()` authentication-aware: accepts nullable `Authentication`, guards `markAsRead()` and premium checks against null/anonymous users. Added tests for anonymous access. Added convention for all auth-aware public endpoints. (6) Added Markdown content contract to cross-cutting conventions — content is raw Markdown, frontends must use safe renderer, no server-side HTML sanitization. (7) Added `updated_by` column to `post_update_log` via Flyway migration `V3__add_audit_updated_by.sql` for audit trail actor attribution. (8) Added `CategoryResponse.from()` static factory method and DTO mapping convention — all response DTOs provide `from()` factory. Updated controller to use `CategoryResponse::from`. (9) Added explicit JPQL for `PostRepository.findAllWithCounts()` using correlated COUNT subqueries (not JOIN+GROUP BY) to avoid fan-out problem. Documented separate tag batch-loading strategy. (10) Added `countQuery` and `Pageable` to full-text search native query for proper pagination support. (11) Added idempotent `LikeRepository.likePost()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`), matching ReadPost pattern. (12) Added missing integration tests for category update: `updateCategory_asAdmin_returns200`, `_duplicateName_returns400`, `_asUser_returns403`. (13) Annotated `findByTagNameIn` as reserved for future use. (14) Added note deferring per-endpoint rate limiting to future phase. |
+| 4.0 | 2026-03-15 | Revised per security audit (`2026-03-15-phase2a-content-crud-implementation-security-audit-1.md`). Changes: (1) **[High] Server-side Markdown sanitization:** Replaced client-side-only XSS defense with server-side render + sanitize pipeline. Added commonmark-java + OWASP Java HTML Sanitizer. Created `MarkdownSanitizer` component. Content responses now include both `contentRaw` and `contentHtml` fields. Updated content contract convention. (2) **[Medium] Full-text search input constraints:** Added `@Size(max = 200)` validation on search query parameter in PostController. Added code comment documenting `plainto_tsquery` is intentional for safety. (3) **[Medium] Comments endpoint deleted-post check:** `GET /api/v1/posts/{id}/comments` now verifies post is not soft-deleted before returning comments — prevents information disclosure for deleted posts. Added integration test. (4) **[Medium] Per-endpoint rate limiting:** Moved from deferred to Phase 2A. Added comment creation (10 req/min) and like/unlike (30 req/min) per-user limits as additional tiers in existing `RateLimitFilter`. (5) **[Low] Audit log forensic fields:** Added `ip_address VARCHAR(45)` and `user_agent VARCHAR(500)` to `post_update_log` migration (`V3`). Populated from `HttpServletRequest` via `RequestContextHolder`. Subject to 90-day retention policy (cleanup job in Phase 2B). |
