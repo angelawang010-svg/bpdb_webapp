@@ -1,6 +1,6 @@
 # Phase 3: Front-End (React SPA) — Implementation Plan
 
-**Version:** 3.0
+**Version:** 3.1
 **Last Updated:** 2026-03-16
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
@@ -112,12 +112,20 @@ export default defineConfig({
 
 Configure Tailwind v4 per their docs. Add `@import "tailwindcss";` to `src/index.css`. Tailwind v4 uses CSS-based configuration — no `tailwind.config.js` file is needed.
 
-**Step 5: Verify dev server starts**
+**Step 5: Add CSP meta tag to `index.html`**
+
+Add a Content Security Policy meta tag to `frontend/index.html` for defense-in-depth against XSS:
+```html
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; connect-src 'self'">
+```
+> Production CSP headers will be configured via Nginx in Phase 4, but this provides baseline protection during development.
+
+**Step 6: Verify dev server starts**
 
 Run: `cd frontend && npm run dev`
 Expected: Vite dev server at `http://localhost:5173`, proxy forwards `/api` to `localhost:8080`.
 
-**Step 6: Commit**
+**Step 7: Commit**
 
 ```bash
 git add frontend/
@@ -386,10 +394,12 @@ Add to `client.ts`:
 export async function primeCsrfToken(): Promise<void> {
   try {
     await client.get('/auth/csrf');
-  } catch {
-    // Non-fatal — CSRF cookie may already exist from a prior session.
-    // If it truly doesn't exist, the first POST will fail and the user
-    // can retry after the GET has set the cookie.
+  } catch (err) {
+    console.warn('CSRF priming failed:', err);
+  }
+  // Verify cookie was actually set
+  if (!document.cookie.includes('XSRF-TOKEN=')) {
+    console.error('CSRF cookie not set after priming — mutations will fail');
   }
 }
 ```
@@ -839,7 +849,7 @@ Same pattern for `useSave` (toggling `hasSaved`).
 
 `CommentList`: renders threaded comments recursively, **with a max depth of 3 levels** (matching the back-end's `CommentService` which re-parents replies beyond depth 3). Beyond depth 3, replies are flattened or a "Continue thread" link is shown to prevent excessive DOM nesting and indentation overflow.
 
-`CommentItem`: single comment with reply button, delete button (if owner).
+`CommentItem`: single comment with reply button, delete button (if owner). **Comment `content` is rendered as plain text** (React's default JSX text interpolation `{comment.content}`). Do NOT use `react-markdown`, `dangerouslySetInnerHTML`, or any HTML rendering for comments — they are short-form text, not rich content.
 
 `CommentForm`: textarea with 250-char limit and character counter. Disabled if user hasn't read the post.
 
@@ -926,9 +936,11 @@ git commit -m "feat: add Profile and Saved Posts pages"
 `useNotifications` hook:
 ```typescript
 export function useNotifications() {
+  const { user } = useAuth();
   return useQuery({
     queryKey: ['notifications'],
     queryFn: () => notificationsApi.getNotifications(),
+    enabled: !!user, // stop polling when logged out (prevents repeated 401s on session expiry)
     refetchInterval: 30_000, // 30-second polling
     refetchIntervalInBackground: false, // stop polling when tab is hidden
     retry: (failureCount) => failureCount < 3,
@@ -998,7 +1010,20 @@ git commit -m "feat: add Admin dashboard with category/tag/user management"
 
 `AuthorsPage`: list all authors with post counts.
 
-`AuthorPage`: author detail — biography, social links, paginated posts by that author.
+`AuthorPage`: author detail — biography, social links, paginated posts by that author. **Security: validate social link URLs before rendering as `<a href>`.** Only allow `http:` and `https:` protocols to prevent `javascript:` XSS:
+```typescript
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return ['http:', 'https:'].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+// Render: {isSafeUrl(url) && <a href={url}>...}
+```
+
+**Security: validate `profilePicUrl`** in `ProfileCard` (Task 12) similarly — only render `<img src>` if the URL uses `http:` or `https:` protocol, or is null.
 
 **Step 2: Commit**
 
@@ -1063,7 +1088,7 @@ describe('Auth Flow', () => {
     cy.visit('/register');
     cy.get('[name=username]').type('e2euser');
     cy.get('[name=email]').type('e2e@test.com');
-    cy.get('[name=password]').type('Password1');
+    cy.get('[name=password]').type('E2eT3st!Pass2026');
     cy.get('button[type=submit]').click();
     cy.url().should('eq', Cypress.config().baseUrl + '/');
     // Browse posts, click first post, add comment, logout
@@ -1072,6 +1097,24 @@ describe('Auth Flow', () => {
 ```
 
 `post-flow.cy.ts`: Author login → create post → edit → delete.
+
+`auth-flow.cy.ts` — **Backend authorization verification tests:**
+```typescript
+describe('Backend Role Enforcement', () => {
+  it('non-admin cannot access admin endpoints', () => {
+    cy.loginAs('regularuser');
+    cy.request({ url: '/api/v1/admin/users', failOnStatusCode: false })
+      .its('status').should('eq', 403);
+  });
+
+  it('non-author cannot create posts', () => {
+    cy.loginAs('regularuser');
+    cy.request({ method: 'POST', url: '/api/v1/posts', body: { title: 'test' }, failOnStatusCode: false })
+      .its('status').should('eq', 403);
+  });
+});
+```
+> These tests verify that backend Spring Security enforces role-based authorization, not just the client-side `ProtectedRoute`.
 
 **Step 3: Run E2E tests against running stack**
 
@@ -1137,6 +1180,20 @@ Phase 3 delivers (19 tasks — Task 0 through Task 18):
 ---
 
 ## Changelog
+
+### v3.1 — 2026-03-16
+
+Revision per [security audit](./2026-03-16-phase3-frontend-implementation-security-audit-1.md).
+
+**Fixes:**
+- **[SA-1] URL protocol validation for `socialLinks`:** Added `isSafeUrl()` utility to Task 15 — only renders social links as `<a href>` if protocol is `http:` or `https:`, preventing `javascript:` XSS. (Task 15)
+- **[SA-2] URL validation for `profilePicUrl`:** Added validation note to Task 15 for `ProfileCard` (Task 12) — only render `<img src>` for safe URLs. (Task 15)
+- **[SA-3] CSRF priming failure detection:** `primeCsrfToken()` now logs a warning on failure and checks whether the `XSRF-TOKEN` cookie was actually set, instead of silently swallowing all errors. (Task 4)
+- **[SA-4] Comment content rendered as plain text:** Explicitly specified that `CommentItem` renders `content` via React's default JSX text interpolation — no Markdown, no `dangerouslySetInnerHTML`. (Task 10)
+- **[SA-5] CSP meta tag:** Added `Content-Security-Policy` meta tag to `index.html` in Task 1 for defense-in-depth XSS protection. Production CSP headers deferred to Phase 4 Nginx config. (Task 1)
+- **[SA-6] Backend role enforcement verification:** Added Cypress E2E tests in Task 17 that confirm backend returns 403 for unauthorized role access to admin and author endpoints. (Task 17)
+- **[SA-7] Notification polling stops on logout:** Added `enabled: !!user` to `useNotifications` hook to prevent repeated 401s when session expires. (Task 13)
+- **[SA-8] Stronger E2E test password:** Changed test password from `Password1` to `E2eT3st!Pass2026`. (Task 17)
 
 ### v3.0 — 2026-03-16
 
