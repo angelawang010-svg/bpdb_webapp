@@ -1,6 +1,6 @@
 # Phase 3: Front-End (React SPA) — Implementation Plan
 
-**Version:** 2.0
+**Version:** 3.0
 **Last Updated:** 2026-03-16
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
@@ -14,6 +14,46 @@
 **Reference:** Design document at `docs/plans/design/2026-02-27-java-migration-design.md` (v7.0) — Section 3 (Front-End Structure).
 
 **Prerequisite:** Phase 2 must be complete (full REST API running).
+
+---
+
+### Task 0: Back-End Prerequisite — Add CSRF Priming Endpoint
+
+> **This task modifies the Phase 1B back-end.** The front-end's `primeCsrfToken()` (Task 4) depends on this endpoint existing.
+
+**Files:**
+- Modify: `backend/src/main/java/com/blogplatform/auth/AuthController.java`
+- Modify: `backend/src/main/java/com/blogplatform/config/SecurityConfig.java`
+
+**Step 1: Add CSRF endpoint to AuthController**
+
+Add to `AuthController.java`:
+```java
+@GetMapping("/csrf")
+public ResponseEntity<Void> csrf() {
+    return ResponseEntity.noContent().build();
+}
+```
+
+This lightweight GET endpoint exists solely to trigger Spring Security's deferred CSRF token generation, which sets the `XSRF-TOKEN` cookie in the response.
+
+**Step 2: Add to SecurityConfig permitAll**
+
+In `SecurityConfig.java`, add `/api/v1/auth/csrf` to the permitAll matchers:
+```java
+.requestMatchers("/api/v1/auth/register", "/api/v1/auth/login",
+    "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password",
+    "/api/v1/auth/verify-email", "/api/v1/auth/csrf").permitAll()
+```
+
+**Step 3: Verify and commit**
+
+```bash
+cd backend && ./gradlew test
+git add backend/src/main/java/com/blogplatform/auth/AuthController.java \
+       backend/src/main/java/com/blogplatform/config/SecurityConfig.java
+git commit -m "feat: add /auth/csrf GET endpoint for SPA CSRF token priming"
+```
 
 ---
 
@@ -232,6 +272,11 @@ Simple, reusable UI components. `ConfirmDialog` used for delete confirmations (p
 
 `ErrorBoundary`: a React error boundary wrapping the route outlet. Catches render errors, displays a user-friendly fallback with a "Try Again" button that resets error state. Prevents the entire app from white-screening on a single component error.
 
+**Loading state convention:** Apply consistently across all tasks that follow:
+- **Auth initialization** (`AuthContext.isLoading`) → full-page `LoadingSpinner` (handled by `ProtectedRoute` and `App`)
+- **Page-level data fetching** (React Query `isLoading`) → inline `LoadingSpinner` below the header, preserving page layout
+- **Mutations** (form submits, like/save toggles) → disable the triggering button and show a spinner inside it
+
 **Step 2: Commit**
 
 ```bash
@@ -270,6 +315,8 @@ import { VALID_ROLES, type User } from '../types/user';
 export function validateUser(data: unknown): User {
   const obj = data as Record<string, unknown>;
   if (!obj || typeof obj !== 'object') throw new Error('Invalid user response');
+  if (typeof obj.accountId !== 'number') throw new Error('Invalid accountId');
+  if (typeof obj.username !== 'string' || obj.username.length === 0) throw new Error('Invalid username');
   if (typeof obj.role !== 'string' || !VALID_ROLES.includes(obj.role as any)) {
     console.error('Unexpected role value from API:', obj.role);
     throw new Error(`Invalid role: ${obj.role}`);
@@ -447,7 +494,7 @@ test('useAuth returns null user when not logged in', () => {
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { User } from '../types/user';
 import * as authApi from '../api/auth';
-import { setOnUnauthorized } from '../api/client';
+import { primeCsrfToken, setOnUnauthorized } from '../api/client';
 
 interface AuthContextType {
   user: User | null;
@@ -464,24 +511,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
+  // 401 interceptor only clears user state — ProtectedRoute owns all redirect logic.
+  // This avoids maintaining a fragile public-path allowlist that duplicates routing config.
   const handleUnauthorized = useCallback(() => {
     setUser(null);
-    // Only redirect if not already on a public page
-    const publicPaths = ['/', '/login', '/register', '/posts', '/authors'];
-    const isPublic = publicPaths.some((p) => window.location.pathname === p)
-      || window.location.pathname.startsWith('/posts/')
-      || window.location.pathname.startsWith('/authors/');
-    if (!isPublic) {
-      window.location.href = '/login';
-    }
   }, []);
 
   useEffect(() => {
     setOnUnauthorized(handleUnauthorized);
-    authApi.getCurrentUser()
-      .then((user) => setUser(user))
-      .catch(() => setUser(null))
-      .finally(() => setIsLoading(false));
+    // Prime CSRF token and check session in parallel. Both must complete
+    // before isLoading becomes false, ensuring the CSRF cookie exists
+    // before any mutation is possible (eliminates race condition).
+    Promise.all([
+      primeCsrfToken(),
+      authApi.getCurrentUser().then(setUser).catch(() => setUser(null)),
+    ]).finally(() => setIsLoading(false));
     return () => setOnUnauthorized(null);
   }, [handleUnauthorized]);
 
@@ -496,8 +540,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = async () => {
-    await authApi.logout();
-    setUser(null);
+    try {
+      await authApi.logout();
+    } finally {
+      setUser(null);
+    }
   };
 
   return (
@@ -516,7 +563,9 @@ export function useAuth() {
 
 **Key changes from v1.0:**
 - `useAuth` is defined in `AuthContext.tsx` (single canonical location). `hooks/useAuth.ts` re-exports it: `export { useAuth } from '../context/AuthContext';`
-- The 401 handler uses a callback pattern — `AuthContext` registers `handleUnauthorized` via `setOnUnauthorized()` and controls redirect logic. The `getCurrentUser()` 401 failure is handled gracefully in the `catch` block without triggering a redirect loop.
+- The 401 handler uses a callback pattern — `AuthContext` registers `handleUnauthorized` via `setOnUnauthorized()`. The callback only clears user state (`setUser(null)`); `ProtectedRoute` owns all redirect-to-login logic. This eliminates the fragile public-path allowlist and prevents the infinite redirect loop.
+- CSRF priming and session check run in parallel via `Promise.all` before `isLoading` becomes `false`, ensuring the CSRF cookie exists before any mutation is possible.
+- `logout` uses `try/finally` to always clear local state even if the server request fails.
 - Auth API functions now return validated `User` objects directly (via `validateUser`), so `res.data.data` unwrapping is no longer needed here.
 
 `frontend/src/hooks/useAuth.ts`:
@@ -561,18 +610,9 @@ const queryClient = new QueryClient({
 });
 ```
 
-**Step 2: Prime CSRF token on app init**
+**Step 2: Implement routing**
 
-In `App.tsx`, call `primeCsrfToken()` once on mount to ensure the CSRF cookie exists before any mutation:
-```typescript
-import { primeCsrfToken } from './api/client';
-
-useEffect(() => {
-  primeCsrfToken();
-}, []);
-```
-
-**Step 3: Implement routing**
+> Note: CSRF priming is handled by `AuthProvider` (Task 6) via `Promise.all` alongside session check. No separate `useEffect` needed in `App.tsx`.
 
 `App.tsx` sets up React Router with all routes. Wrap the route outlet with `ErrorBoundary`:
 ```typescript
@@ -599,6 +639,7 @@ useEffect(() => {
           <Route element={<ProtectedRoute requiredRoles={['ADMIN']} />}>
             <Route path="/admin" element={<AdminDashboard />} />
           </Route>
+          <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>
     </BrowserRouter>
@@ -610,15 +651,15 @@ useEffect(() => {
 - `ProtectedRoute` accepts `requiredRoles` as an array of `Role` strings (e.g., `['AUTHOR', 'ADMIN']`) instead of a single `requiredRole` string. This allows create/edit post routes to be accessible to both authors and admins.
 - Create/edit post routes are now guarded with `requiredRoles={['AUTHOR', 'ADMIN']}`.
 - `QueryClient` is configured with `staleTime`, `retry`, and `refetchOnWindowFocus` defaults.
-- CSRF token is primed on app mount.
+- Added `<Route path="*">` catch-all rendering a `NotFoundPage` for undefined routes.
 
-`ProtectedRoute`: checks `useAuth()`. Shows `LoadingSpinner` while `isLoading` is true. Redirects to `/login` if not authenticated. If `requiredRoles` prop is provided, checks that `user.role` is in the array — renders an "Access Denied" message if not.
+`ProtectedRoute`: checks `useAuth()`. Shows `LoadingSpinner` while `isLoading` is true. Redirects to `/login` via React Router's `<Navigate to="/login" />` if not authenticated — this is the **single place** that handles auth redirects (the 401 interceptor only clears user state). If `requiredRoles` prop is provided, checks that `user.role` is in the array — renders an "Access Denied" message if not.
 
 `Header`: nav bar with logo, links, user menu, notifications bell (badge with unread count). "Create Post" link only visible when `user.role` is `AUTHOR` or `ADMIN`. Notification bell uses `aria-label` with unread count for screen reader support.
 
 `Layout`: wraps pages with Header + Footer using React Router's `<Outlet />`. Wraps the outlet with `ErrorBoundary`.
 
-**Step 4: Write test for ProtectedRoute**
+**Step 3: Write test for ProtectedRoute**
 
 ```typescript
 test('ProtectedRoute redirects to login when not authenticated', () => {
@@ -634,9 +675,9 @@ test('ProtectedRoute shows access denied for insufficient role', () => {
 });
 ```
 
-**Step 5: Verify it compiles and tests pass**
+**Step 4: Verify it compiles and tests pass**
 
-**Step 6: Commit**
+**Step 5: Commit**
 
 ```bash
 git commit -m "feat: add routing, layout, Header, Footer, ProtectedRoute with role array support"
@@ -721,7 +762,7 @@ export function usePosts(filters: PostFilters) {
 }
 ```
 
-`PostFilters` component: dropdowns for category/tag/author, search input. Changes update URL query params and trigger new fetch. **Text search input uses 300ms debounce** to avoid excessive API calls on each keystroke.
+`PostFilters` component: dropdowns for category/tag/author, search input. **Uses `useSearchParams` as the single source of truth** — filter state is derived from URL query params, and filter changes call `setSearchParams()`. This ensures browser back/forward restores filters and direct URL sharing works. **Text search input uses 300ms debounce** before updating the search param to avoid excessive API calls on each keystroke.
 
 `HomePage` composes these: PostFilters + list of PostCards + Pagination.
 
@@ -794,7 +835,9 @@ export function useLike(postId: number) {
 
 Same pattern for `useSave` (toggling `hasSaved`).
 
-`CommentList`: renders threaded comments recursively, **with a max depth of 5 levels**. Beyond depth 5, replies are flattened or a "Continue thread" link is shown to prevent excessive DOM nesting and indentation overflow.
+**Cache invalidation convention:** Every `useMutation` across all tasks must include `onSuccess` (or `onSettled`) with `queryClient.invalidateQueries()` for affected query keys. Key mappings: post creation/deletion → `['posts']`, comment creation/deletion → `['comments', postId]`, profile update → `['user']`, admin actions → relevant entity key. Likes/saves use the optimistic pattern above with `onSettled` invalidation.
+
+`CommentList`: renders threaded comments recursively, **with a max depth of 3 levels** (matching the back-end's `CommentService` which re-parents replies beyond depth 3). Beyond depth 3, replies are flattened or a "Continue thread" link is shown to prevent excessive DOM nesting and indentation overflow.
 
 `CommentItem`: single comment with reply button, delete button (if owner).
 
@@ -1068,7 +1111,8 @@ git commit -m "fix: phase 3 smoke test fixes"
 
 ## Summary
 
-Phase 3 delivers (18 tasks):
+Phase 3 delivers (19 tasks — Task 0 through Task 18):
+- Back-end CSRF priming endpoint (`/auth/csrf`) added to existing AuthController
 - Vite + React + TypeScript project with Tailwind CSS v4
 - Vite proxy for API requests during development
 - TypeScript types mirroring back-end DTOs with runtime validation at API boundary
@@ -1094,6 +1138,25 @@ Phase 3 delivers (18 tasks):
 
 ## Changelog
 
+### v3.0 — 2026-03-16
+
+Revision per [critical implementation review v2](./2026-03-01-phase3-frontend-implementation-critical-review-2.md).
+
+**Critical fixes:**
+- **[2.1] Added `/auth/csrf` back-end endpoint:** New Task 0 adds a lightweight GET endpoint to `AuthController` and a `permitAll` entry to `SecurityConfig`. This ensures `primeCsrfToken()` actually triggers CSRF cookie generation instead of silently 404-ing. (Task 0)
+- **[2.2] Aligned comment depth to back-end limit of 3:** Front-end `CommentList` max depth changed from 5 to 3 to match `CommentService`'s re-parenting logic. Prevents dead code and user confusion from silently re-parented replies. (Task 10)
+- **[2.3] Simplified 401 redirect — `ProtectedRoute` owns all redirects:** Removed fragile public-path allowlist from `handleUnauthorized`. The 401 interceptor now only calls `setUser(null)`. `ProtectedRoute` is the single place that redirects to `/login` via React Router's `<Navigate>`, avoiding full-page reloads. (Task 6, Task 7)
+- **[2.4] Added loading state convention:** Documented three-tier loading pattern in Task 3: full-page spinner for auth init, inline spinner for page data, disabled button for mutations. Prevents inconsistent loading UX across tasks. (Task 3)
+
+**Minor fixes:**
+- **[3.1]** Expanded `validateUser` to check `accountId` is a number and `username` is a non-empty string, catching field renames at the API boundary (Task 4)
+- **[3.2]** Wrapped `logout` in `try/finally` so `setUser(null)` always executes even if the server request fails (Task 6)
+- **[3.3]** Moved `primeCsrfToken()` into `AuthProvider`, running it via `Promise.all` alongside `getCurrentUser()` before `isLoading` becomes `false` — eliminates race condition where users could submit mutations before CSRF cookie exists (Task 6)
+- **[3.4]** `ProtectedRoute` uses React Router's `<Navigate>` instead of `window.location.href`, preserving SPA state and React Query cache on redirect (Task 7)
+- **[3.5]** Added cache invalidation convention: every `useMutation` must include `onSuccess`/`onSettled` with `invalidateQueries` for affected query keys (Task 10)
+- **[3.7]** Specified `useSearchParams` as source of truth for `PostFilters` — ensures URL-driven filter state with browser back/forward support (Task 9)
+- **[3.8]** Added `<Route path="*">` catch-all rendering `NotFoundPage` for undefined routes (Task 7)
+
 ### v2.0 — 2026-03-16
 
 Revision per [critical implementation review v1](./2026-03-01-phase3-frontend-implementation-critical-review-1.md).
@@ -1113,7 +1176,7 @@ Revision per [critical implementation review v1](./2026-03-01-phase3-frontend-im
 - **[3.3]** Added optimistic updates for likes and saves via `useMutation.onMutate` with automatic rollback (Task 10)
 - **[3.4]** Added `refetchIntervalInBackground: false` to notification polling (Task 13)
 - **[3.5]** Added `QueryClient` configuration with `staleTime`, `retry`, `refetchOnWindowFocus` defaults (Task 7)
-- **[3.6]** Added max depth of 5 for recursive comment rendering; beyond that, replies flatten or show "Continue thread" (Task 10)
+- **[3.6]** Added max depth for recursive comment rendering; beyond that, replies flatten or show "Continue thread" (Task 10) *(corrected to depth 3 in v3.0)*
 - **[3.7]** Added 300ms debounce on text search input in `PostFilters` (Task 9)
 - **[3.8]** Added accessibility requirements inline: `<label>` elements on forms, `aria-label` on icon buttons (notification bell, like/save), focus management notes (Tasks 8, 13)
 - **[3.9]** Updated to Tailwind CSS v4 — uses `@import "tailwindcss"` instead of `@tailwind` directives, CSS-based config instead of `tailwind.config.js` (Task 1)
