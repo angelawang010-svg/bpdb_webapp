@@ -1046,141 +1046,108 @@ Build the React application.
 
 **Deliverable:** Full working web application (React + Spring Boot + PostgreSQL).
 
-### Phase 4: Production Deployment (VPS)
+### Phase 4: Local Production Deployment (Mac)
 
-Deploy to a VPS and prepare for real users. See Section 10 for full deployment details.
+Deploy via Docker Compose on a personal Mac for local production use. See Section 10 for full deployment details. VPS deployment is deferred to Phase 5+.
 
 - Environment-specific configuration (dev, staging, production)
-- Production Dockerfiles for both back-end and front-end
-- Docker Compose for full-stack production deployment
-- Nginx reverse proxy configuration (serves React static files, proxies /api to Spring Boot)
-- HTTPS via Let's Encrypt / Certbot
-- UFW firewall configuration (allow only ports 80, 443, 22)
+- Production Dockerfiles for both back-end and front-end (non-root users, healthchecks)
+- Docker Compose for full-stack local deployment with network segmentation and resource limits
+- Nginx reverse proxy configuration (HTTP, serves React static files, proxies /api to Spring Boot, rate limiting)
 - Logging configuration (structured JSON logs, log rotation)
 - Health check endpoint (`/actuator/health`) — only exposed Actuator endpoint (`management.endpoints.web.exposure.include=health` in `application-prod.yml`)
-- Database backup script (pg_dump cron job: 7 daily + 4 weekly + 3 monthly retention)
+- Database backup script (pg_dump, launchd scheduler: 7 daily + 4 weekly + 3 monthly retention)
 - Global rate limiting already configured in Phase 1 (Bucket4j)
 - XSS prevention (see XSS Prevention section below)
 - Performance: connection pooling (HikariCP, default in Spring Boot), query optimization
 - Basic monitoring with Docker health checks and log alerts
 
-**Deliverable:** Production-ready application running on a VPS, accessible via HTTPS.
+**Deliverable:** Production-ready application running locally on Mac via Docker Compose.
 
-### Phase 5 (Optional): AWS Cloud Migration
+### Phase 5 (Optional): VPS or Cloud Deployment
 
-Migrate from VPS to AWS if you outgrow a single server. See Section 11 for full details. This phase is optional and only needed if:
+Deploy to a VPS or migrate to AWS if you want to serve remote users or outgrow a single machine. See Sections 10-11 for full details. This phase is optional and only needed if:
+- You want the application accessible from the internet (not just localhost)
 - You need high availability (zero downtime during server restarts)
 - You need to handle significantly more than a few thousand users
 - You want managed database backups with point-in-time recovery
-- You want a global CDN for faster page loads worldwide
 
-**Deliverable:** Application running on AWS with managed infrastructure.
+**Deliverable:** Application running on a VPS (with HTTPS, firewall, SSH hardening) or AWS with managed infrastructure.
 
 ---
 
-## 10. VPS Deployment Plan
+## 10. Deployment Plan
 
-### Architecture on the VPS
+### Phase 4: Local Mac Deployment
+
+Phase 4 targets local deployment on a personal Mac via Docker Compose. This is sufficient for development, demo, and personal use.
+
+### Architecture (Local Mac)
 
 ```
-VPS (~$6-12/month)
+Mac (Docker Desktop)
 ┌──────────────────────────────────────────────────────┐
 │                                                      │
-│  UFW Firewall (ports 80, 443, 22 only)               │
-│                                                      │
-│  ┌────────────────────────────────────────────────┐  │
-│  │              Docker Compose                     │  │
-│  │                                                 │  │
-│  │  ┌──────────────────────────────────────────┐   │  │
-│  │  │            Nginx (container)              │   │  │
-│  │  │                                           │   │  │
-│  │  │  :80  → redirect to :443                  │   │  │
-│  │  │  :443 → HTTPS (Let's Encrypt cert)        │   │  │
-│  │  │                                           │   │  │
-│  │  │  /           → serves React static files  │   │  │
-│  │  │  /api/v1/*   → proxy to Spring Boot:8080  │   │  │
-│  │  │  /uploads/*  → serves uploaded images     │   │  │
-│  │  └──────────────────┬───────────────────────┘   │  │
-│  │                     │                            │  │
-│  │  ┌──────────────────┴───────────────────────┐   │  │
-│  │  │       Spring Boot (container)             │   │  │
-│  │  │                                           │   │  │
-│  │  │  :8080 (internal only, not exposed)       │   │  │
-│  │  │  REST API, business logic, auth           │   │  │
-│  │  │  Health check: /actuator/health (only      │   │  │
-│  │  │    exposed endpoint; all others disabled)  │   │  │
-│  │  └──────────────────┬───────────────────────┘   │  │
-│  │                     │                            │  │
-│  │  ┌──────────────────┴───────────────────────┐   │  │
-│  │  │       PostgreSQL 16 (container)           │   │  │
-│  │  │                                           │   │  │
-│  │  │  :5432 (internal only, not exposed)       │   │  │
-│  │  │  Data stored in Docker volume             │   │  │
-│  │  │  Daily pg_dump backups via cron           │   │  │
-│  │  └──────────────────────────────────────────┘   │  │
-│  │                                                 │  │
-│  │  ┌──────────────────────────────────────────┐   │  │
-│  │  │       Redis 7 (container)                 │   │  │
-│  │  │                                           │   │  │
-│  │  │  :6379 (internal only, not exposed)       │   │  │
-│  │  │  Session storage (Spring Session)         │   │  │
-│  │  │  requirepass enabled (password in .env)   │   │  │
-│  │  │  ~50 MB RAM footprint                     │   │  │
-│  │  └──────────────────────────────────────────┘   │  │
-│  │                                                 │  │
-│  └─────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │              Docker Compose                      │ │
+│  │                                                  │ │
+│  │  [frontend network]                              │ │
+│  │  ┌──────────────────────────────────────────┐    │ │
+│  │  │            Nginx (container)              │    │ │
+│  │  │  :80 → HTTP (localhost only)              │    │ │
+│  │  │  /           → serves React static files  │    │ │
+│  │  │  /api/v1/*   → proxy to Spring Boot:8080  │    │ │
+│  │  │  /uploads/*  → serves uploaded images     │    │ │
+│  │  │  Rate limiting on auth + API endpoints    │    │ │
+│  │  └──────────────────┬───────────────────────┘    │ │
+│  │                     │                             │ │
+│  │  ┌──────────────────┴───────────────────────┐    │ │
+│  │  │       Spring Boot (container)             │    │ │
+│  │  │  :8080 (internal only, not exposed)       │    │ │
+│  │  │  REST API, business logic, auth           │    │ │
+│  │  │  Non-root user, resource limits           │    │ │
+│  │  │  Health check: /actuator/health           │    │ │
+│  │  └──────────────────┬───────────────────────┘    │ │
+│  │                     │                             │ │
+│  │  [backend network]  │                             │ │
+│  │  ┌──────────────────┴───────────────────────┐    │ │
+│  │  │       PostgreSQL 16 (container)           │    │ │
+│  │  │  :5432 (internal only, not exposed)       │    │ │
+│  │  │  Data stored in Docker volume             │    │ │
+│  │  │  Daily pg_dump backups via launchd        │    │ │
+│  │  └──────────────────────────────────────────┘    │ │
+│  │                                                  │ │
+│  │  ┌──────────────────────────────────────────┐    │ │
+│  │  │       Redis 7 (container)                 │    │ │
+│  │  │  :6379 (internal only, not exposed)       │    │ │
+│  │  │  Session storage (Spring Session)         │    │ │
+│  │  │  requirepass enabled (password in .env)   │    │ │
+│  │  └──────────────────────────────────────────┘    │ │
+│  │                                                  │ │
+│  └──────────────────────────────────────────────────┘ │
 │                                                      │
 └──────────────────────────────────────────────────────┘
 ```
 
-### VPS Provider (To Be Decided)
+### Prerequisites
 
-Provider will be chosen before Phase 4. Top candidates:
+- **Docker Desktop for Mac** — runs all application containers
+- No VPS, no domain, no SSL certificates needed for local use
 
-| Provider | Starting Price | Strengths |
-|---|---|---|
-| Hetzner | ~$4-7/month | Best price-to-performance, EU + US data centers |
-| DigitalOcean | ~$6-12/month | Most beginner-friendly, excellent tutorials |
-| Linode (Akamai) | ~$5-12/month | Reliable, good community |
-| Vultr | ~$5-10/month | Global locations, competitive pricing |
-
-**Recommended VPS specs for a few thousand users:**
-- 2 vCPUs, 2-4 GB RAM, 40-80 GB SSD
-- Ubuntu 22.04 LTS (or latest LTS)
-- Estimated cost: $6-12/month
-
-### What Gets Installed on the VPS
-
-Only two things need to be installed manually:
-
-1. **Docker + Docker Compose** — runs all application containers
-2. **Certbot** — obtains and auto-renews free SSL certificates from Let's Encrypt
-
-Everything else (Nginx, Spring Boot, PostgreSQL) runs inside Docker containers.
-
-### Deployment Process
+### Deployment Process (Local Mac)
 
 **Initial setup (one time):**
 
 ```bash
-# 1. SSH into the VPS
-ssh user@your-server-ip
-
-# 2. Install Docker
-curl -fsSL https://get.docker.com | sh
-
-# 3. Clone the repository
+# 1. Clone the repository
 git clone https://github.com/your-repo/blog-platform.git
 cd blog-platform
 
-# 4. Create .env file with production secrets
+# 2. Create .env file with production secrets
 cp .env.example .env
-nano .env  # Set all required secrets (see below)
+# Set DB_PASSWORD and REDIS_PASSWORD (minimum 24 characters each)
 
-# 5. Obtain SSL certificate
-certbot certonly --standalone -d yourdomain.com
-
-# 6. Start everything
+# 3. Start everything
 docker compose -f docker-compose.prod.yml up -d
 ```
 
@@ -1190,9 +1157,6 @@ docker compose -f docker-compose.prod.yml up -d
 - Required secrets in `.env`:
   - `DB_PASSWORD` — randomly generated, minimum 24 characters
   - `REDIS_PASSWORD` — randomly generated, minimum 24 characters
-  - `SESSION_SECRET` — randomly generated, minimum 32 characters
-  - `DOMAIN_NAME` — the production domain
-  - `EMAIL_API_KEY` — transactional email service API key (Mailgun, Postmark, or SendGrid)
 
 **Updating the app (on each deploy):**
 
@@ -1211,25 +1175,26 @@ Nginx serves as the single entry point. Key responsibilities:
 
 | Responsibility | How |
 |---|---|
-| HTTPS termination | Reads Let's Encrypt certificate, encrypts all traffic |
-| HTTP → HTTPS redirect | All port 80 requests redirected to port 443 |
 | Serve React SPA | Serves static files from `/usr/share/nginx/html` |
 | API reverse proxy | Forwards `/api/v1/*` requests to Spring Boot at `http://backend:8080` |
+| Rate limiting | Auth endpoints: 5r/m per IP. API endpoints: 30r/s per IP (Nginx-level, complements Bucket4j) |
 | Static file caching | Sets `Cache-Control` headers for CSS/JS/images (long cache, fingerprinted) |
 | Gzip compression | Compresses text responses for faster page loads |
-| Security headers | `X-Frame-Options`, `X-Content-Type-Options: nosniff`, `Strict-Transport-Security`, `Content-Security-Policy: script-src 'self'` (blocks inline script execution). `X-Content-Type-Options: nosniff` also set explicitly on the `/uploads/*` location block to prevent MIME-type sniffing of uploaded files |
+| Security headers | `X-Frame-Options`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy` (complete: default-src, script-src, style-src, img-src, connect-src, font-src, frame-ancestors), `Referrer-Policy`. Applied via shared snippet to avoid Nginx `add_header` inheritance bug |
 | Upload content type | Serve `/uploads/*` with the validated image MIME type only (set by Spring Boot during upload validation). Add `Content-Disposition: inline` only for confirmed image types |
 | Actuator blocking | Block all `/actuator/*` requests except `/actuator/health` — returns 404 for `/actuator/env`, `/actuator/beans`, etc. Defense-in-depth alongside `management.endpoints.web.exposure.include=health` in `application-prod.yml` |
 | Client-side routing | Returns `index.html` for all non-API, non-file routes (React Router handles routing) |
 
+> **Future (VPS deployment):** Add HTTPS termination via Let's Encrypt/Certbot, HTTP→HTTPS redirect, HSTS header, and SSL/TLS hardening (TLSv1.2+, strong ciphers, OCSP stapling).
+
 ### Database Backups
 
-Automated daily backups using a cron job inside the PostgreSQL container or on the host:
+Automated daily backups using macOS launchd scheduler:
 
 ```
-Schedule: Daily at 3:00 AM
+Schedule: Daily at 3:00 AM (launchd plist)
 Method: pg_dump → compressed .sql.gz file
-Storage: /backups/ directory on VPS + optional offsite copy
+Storage: ./backups/ directory in the repo root
 Retention:
   - Daily backups: keep last 7
   - Weekly backups (every Sunday): keep last 4 (30 days)
@@ -1239,36 +1204,33 @@ Restore: pg_restore from any backup file
 
 This extended retention protects against data corruption bugs that go unnoticed for more than a week. Storage cost is negligible (compressed PostgreSQL dumps for a small database are typically a few MB each).
 
-**Automated backup verification (monthly):** A cron job restores the latest backup to a temporary Docker PostgreSQL container, runs basic integrity checks (row counts on key tables), then destroys the container. This ensures backups are actually restorable — untested backups are nearly as risky as no backups.
+> **Future (VPS deployment):** Add automated backup verification (monthly restore to temporary container), Slack webhook alerts on failure, and offsite backup copy.
 
-### Firewall (UFW)
+### Network Segmentation
 
-Only three ports open to the internet:
+Docker Compose uses two internal networks to enforce least-privilege access:
 
-| Port | Protocol | Purpose |
+| Network | Services | Purpose |
 |---|---|---|
-| 22 | TCP | SSH (remote access to the server) |
-| 80 | TCP | HTTP (redirects to HTTPS) |
-| 443 | TCP | HTTPS (all application traffic) |
+| `frontend` | Nginx, Spring Boot | Nginx can only reach the backend |
+| `backend` | Spring Boot, PostgreSQL, Redis | Database/cache isolated from Nginx |
 
-All other ports (8080 for Spring Boot, 5432 for PostgreSQL) are internal only — Docker containers communicate over an internal network that is not exposed to the internet.
+All service ports (8080, 5432, 6379) are internal only — Docker containers communicate over internal networks not exposed to the host.
 
-**SSH hardening:** Key-based authentication only, password authentication disabled (`PasswordAuthentication no` in `sshd_config`), fail2ban installed to block brute-force attempts.
+> **Future (VPS deployment):** Add UFW firewall (ports 22/80/443 only), SSH key-only auth, fail2ban, and `PasswordAuthentication no` in sshd_config.
 
 ### Monitoring
 
-Lightweight monitoring appropriate for a small deployment:
+Lightweight monitoring appropriate for local deployment:
 
 | What | How |
 |---|---|
 | Container health | Docker health checks (`/actuator/health` for Spring Boot) |
 | Container restarts | Docker Compose `restart: unless-stopped` policy |
-| Disk space | Cron job that alerts if disk usage exceeds 70% (critical for image uploads) — alert sent to Slack incoming webhook |
-| Backup failure | pg_dump cron job exit code checked; failure sends alert to Slack incoming webhook |
-| Alert channel | Free Slack incoming webhook — one `curl` call from any cron job; no additional infrastructure required |
+| Resource limits | `deploy.resources.limits` on each container (prevents runaway memory/CPU) |
 | Application logs | `docker compose logs -f` for real-time viewing |
-| Log persistence | Docker logging driver writes to `/var/log/` with rotation |
-| Uptime | Free external monitoring service (e.g., UptimeRobot) pings the health endpoint every 5 minutes |
+
+> **Future (VPS deployment):** Add disk usage monitoring with Slack alerts, log persistence with rotation, and external uptime monitoring (e.g., UptimeRobot).
 
 ### XSS Prevention
 
@@ -1305,27 +1267,14 @@ This ensures application events are captured at INFO, framework noise is suppres
 
 These are acceptable at this scale. **Future improvement path:** Docker Swarm (minimal migration from Compose) or a simple blue-green deploy script that brings up a new container, health-checks it, then swaps Nginx upstream.
 
-### PaaS Alternatives (For Non-Technical Operators)
-
-If the VPS operator is not comfortable with SSH, Docker, and Nginx/Certbot, consider a PaaS (Platform as a Service) instead. These cost slightly more but eliminate server management:
-
-| Provider | Estimated Cost | Strengths |
-|---|---|---|
-| Railway | ~$10-20/month | Easiest to deploy, auto-SSL, git push deploys |
-| Render | ~$10-25/month | Free tier for experiments, managed PostgreSQL |
-| Fly.io | ~$10-20/month | Global edge deployment, Docker-native |
-
-The application is fully containerized (Dockerfiles exist), so migration to any PaaS is straightforward. The VPS deployment docs remain the primary reference.
-
-### Estimated Monthly Cost
+### Estimated Cost (Local Mac Deployment)
 
 | Item | Cost |
 |---|---|
-| VPS (2 vCPU, 2-4 GB RAM) | $6-12 |
-| Domain name | ~$1 (amortized yearly) |
-| SSL certificate | Free (Let's Encrypt) |
-| Monitoring (UptimeRobot) | Free tier |
-| **Total** | **~$7-13/month** |
+| Docker Desktop | Free (personal use) |
+| **Total** | **$0/month** |
+
+> **Future (VPS deployment):** VPS ($6-12/month) + domain (~$1/month amortized) + SSL (free via Let's Encrypt) = ~$7-13/month. PaaS alternatives (Railway, Render, Fly.io) at ~$10-25/month if you prefer managed infrastructure.
 
 ---
 

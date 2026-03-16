@@ -1175,7 +1175,7 @@ Phase 3 delivers (19 tasks — Task 0 through Task 18):
 - Author listing and profile pages (both AuthorsPage and AuthorPage)
 - Cypress E2E tests for critical flows
 
-**Next plan:** Phase 4 (Production Deployment — VPS)
+**Next plan:** Phase 4 (Local Production Deployment — Mac)
 
 ---
 

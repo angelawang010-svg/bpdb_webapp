@@ -40,7 +40,7 @@ Transform the SQL Server database project into a **full-stack modern web applica
 2. **Extract business logic from stored procedures into Java services** — every SP, function, trigger, and view is migrated to equivalent Spring Boot service methods with explicit test coverage validating behavioral equivalence
 3. **Build a REST API** with 30+ endpoints covering all CRUD operations, auth, admin functions, notifications, and file uploads
 4. **Build a React SPA frontend** connected to the API
-5. **Deploy to a self-hosted VPS** (~$6-12/month) instead of AWS (~$50-80/month), with Docker, Nginx, HTTPS, backups, and monitoring
+5. **Deploy locally on a personal Mac** via Docker Compose with Nginx, backups, and monitoring (VPS deployment deferred to Phase 5+)
 6. **Target scale:** A few thousand users
 
 ## 3. Architectural Design Decisions
@@ -55,7 +55,7 @@ The design document went through **7 versions** driven by 3 critical design revi
 | Payment processing | Deferred (501 stub) | Review v2 identified that the payment system had no actual gateway. Decision: stub the VIP upgrade endpoint, defer Stripe integration to Phase 5+. |
 | Content format | Raw Markdown | Review v2 flagged that content format was unspecified. Decision: store Markdown, render client-side with `react-markdown` + `rehype-sanitize`. |
 | Notifications | Async (`@Async` + `@TransactionalEventListener(AFTER_COMMIT)`) with batch `saveAll()` | Review v1 identified synchronous notification creation as a scalability bottleneck. |
-| Deployment target | VPS with Docker Compose (not AWS) | Design v3 replaced AWS with VPS. Rationale: AWS is overkill at this scale. AWS retained as Phase 5+ growth option. |
+| Deployment target | Local Mac with Docker Compose (VPS/AWS deferred) | Design v3 replaced AWS with VPS. Later revised to local Mac deployment for Phase 4; VPS and AWS deferred to Phase 5+. |
 | Soft delete implementation | Hibernate `@FilterDef`/`@Filter` (not `@Where`) | Review v2 identified that `@Where` prevents admin access to deleted content. Replaced with toggleable filter. |
 | Password reset | Moved from "Deferred" to Phase 2 | Review v3 argued password reset is a baseline auth requirement, not optional. |
 | Comment nesting | Capped at depth 3 | Review v3 identified unbounded recursion risk. Service walks parent chain and re-parents if depth exceeds limit. |
@@ -155,18 +155,16 @@ The design document went through **7 versions** driven by 3 critical design revi
 - MSW mock server for component tests
 - Cypress E2E tests
 
-### Phase 4: Production Deployment (10 tasks)
-- Multi-stage Dockerfiles (backend: temurin:21-jdk build → temurin:21-jre run; frontend: node:20-alpine build → nginx:alpine serve)
-- Production Docker Compose: 4 containers (Nginx, Spring Boot, PostgreSQL, Redis) with healthchecks, restart policies, named volumes
-- Nginx: HTTPS (Let's Encrypt/Certbot), security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy), API proxy, actuator blocking, SPA routing, upload serving, gzip, asset caching
-- `.env`-driven configuration (24-char minimum passwords, full secrets inventory)
-- Backup scripts (pg_dump, tiered retention: 7 daily / 4 weekly / 3 monthly)
-- Monthly automated backup verification (restore to temporary container, integrity check)
-- Disk usage monitoring with Slack webhook alerts
-- VPS setup script (Docker, Certbot, fail2ban, UFW firewall: ports 22/80/443 only, SSH key-only auth)
-- Local production smoke test
+### Phase 4: Local Production Deployment — Mac (8 tasks)
+- Multi-stage Dockerfiles (backend: temurin:21-jdk build → temurin:21-jre run, non-root user; frontend: node:20-alpine build → nginx:alpine serve)
+- Production Docker Compose: 4 containers (Nginx, Spring Boot, PostgreSQL, Redis) with healthchecks, restart policies, network segmentation, resource limits
+- Nginx: HTTP (localhost), security headers (CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy), rate limiting, API proxy, actuator blocking, SPA routing, upload serving, gzip, asset caching
+- `.env`-driven configuration (24-char minimum passwords)
+- Backup script (pg_dump, tiered retention: 7 daily / 4 weekly / 3 monthly, macOS launchd scheduler)
+- Local smoke test
 
 ### Phase 5+ (Deferred / Future)
+- VPS deployment (HTTPS via Let's Encrypt, UFW firewall, fail2ban, SSH hardening, Slack monitoring alerts, backup verification)
 - AWS cloud migration (ElastiCache, RDS, S3, ECS/EKS, CloudFront)
 - Stripe Checkout for VIP payments
 - OAuth2 / 2FA
@@ -215,7 +213,7 @@ The design document went through **7 versions** driven by 3 critical design revi
 - **Token security:** Password reset and email verification tokens: 32 bytes cryptographically random (SecureRandom), URL-safe base64 encoded, stored as SHA-256 hashes, 30-minute expiry, single-use.
 - **Image upload:** Apache Tika magic byte validation (not just Content-Type header), UUID-based filenames (prevents path traversal), 5MB max file size, 100MB per-user quota, JPEG/PNG/WebP only.
 - **Ownership verification:** Centralized `OwnershipVerifier` utility used via `@PreAuthorize("@ownershipVerifier.isOwnerOrAdmin(#id, authentication)")` on all owner-only endpoints.
-- **Infrastructure:** UFW firewall (22/80/443 only), SSH key-only auth, fail2ban, Redis `requirepass`, actuator restricted to `/health` only, Swagger gated behind dev profile.
+- **Infrastructure:** Docker network segmentation (frontend/backend isolation), container resource limits, Redis `requirepass`, actuator restricted to `/health` only, Swagger gated behind dev profile. VPS hardening (UFW, fail2ban, SSH key-only auth) deferred to Phase 5+.
 
 ### 5.4 Security Audit Scores
 
@@ -264,7 +262,7 @@ We are transforming that filing cabinet into a fully functional office building:
 
 3. **A new filing system (the database):** We moved from Microsoft SQL Server to PostgreSQL — a free, open-source database that is just as capable but costs nothing to license. The data structure stays essentially the same; we are just translating it to a new system.
 
-4. **A building with security (the deployment):** The whole thing runs on a rented server (VPS — like renting a small office in the cloud) with locks on the doors (firewall, encryption, authentication), a security camera (monitoring), and automatic backups.
+4. **A building with security (the deployment):** The whole thing runs on your personal Mac via Docker containers (standardized software packages) with locks on the doors (authentication, rate limiting), and automatic backups. It can later be moved to a rented server for internet access.
 
 ## Why Are We Doing This?
 
@@ -274,7 +272,7 @@ We are transforming that filing cabinet into a fully functional office building:
 | Business rules trapped inside the database | Business rules in the application where they are easier to test, change, and maintain |
 | Microsoft SQL Server (licensing costs) | PostgreSQL (free, open-source) |
 | No security beyond database passwords | Multi-layered security: encrypted connections, rate limiting, brute-force protection, XSS prevention |
-| No deployment plan | Runs on a ~$6-12/month server with automated backups and monitoring |
+| No deployment plan | Runs locally via Docker Compose with automated backups (VPS deployment optional) |
 
 ## How Is the Work Organized?
 
@@ -314,25 +312,20 @@ The project is divided into 4 main phases, like building a house:
 - Admin dashboard
 - Mobile-friendly design
 
-### Phase 4: Going Live (10 tasks planned)
-*Analogy: Getting the occupancy permit, connecting utilities, opening the doors*
+### Phase 4: Running Locally (8 tasks planned)
+*Analogy: Setting up and running the building on your own property*
 
 - Package everything into Docker containers (standardized shipping containers for software — ensures it runs the same everywhere)
-- Set up the production server with HTTPS (the padlock icon in your browser)
+- Run the full application on your Mac via Docker Compose
 - Automated daily backups with tiered retention (7 daily, 4 weekly, 3 monthly)
-- Monthly backup verification (automatically tests that backups actually work)
-- Monitoring alerts via Slack if the server runs low on disk space
-- Firewall configuration (only 3 doors into the building: web traffic on ports 80/443, and admin access on port 22)
+- Security: network isolation between containers, rate limiting, resource limits
 
 ## How Much Will It Cost to Run?
 
-- **Server:** ~$6-12/month for a VPS (Virtual Private Server) — comparable to a basic web hosting plan
+- **Local deployment (Phase 4):** $0/month — runs on your personal Mac via Docker Desktop (free for personal use)
 - **Database:** $0 (PostgreSQL is free)
-- **SSL Certificate:** $0 (Let's Encrypt provides free certificates)
-- **Monitoring:** $0 (built-in scripts + free Slack webhook)
-- **Total:** Approximately $6-12/month for a few thousand users
-
-For comparison, the AWS cloud alternative was estimated at $50-80/month for the same workload, which is why it was deferred to a future phase if the platform outgrows a single server.
+- **VPS deployment (Phase 5+, optional):** ~$6-12/month if you want the application accessible on the internet
+- **AWS cloud (Phase 5+, optional):** ~$50-80/month if you outgrow a single server
 
 ## Quality Assurance and Security
 
