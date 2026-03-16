@@ -1,6 +1,6 @@
 # Phase 2B: Platform Features — Implementation Plan
 
-**Version:** 3.0
+**Version:** 4.0
 
 (Part 2 of 2 — Tasks 11-22 of 22)
 
@@ -170,7 +170,7 @@ Also implement:
 Note: Notification cleanup is handled by Task 19 (ScheduledJobs), not here.
 
 `NotificationController`:
-- `GET /api/v1/notifications` — authenticated, extracts `account_id` from security context (NEVER from request params)
+- `GET /api/v1/notifications` — authenticated, extracts `account_id` from security context (NEVER from request params). Enforce max page size of 50 (configure `spring.data.web.pageable.max-page-size=50` or cap in controller).
 - `PUT /api/v1/notifications/{id}/read` — owner only
 - `PUT /api/v1/notifications/read-all` — authenticated
 
@@ -361,6 +361,7 @@ Token spec per design doc:
 - Single-use (`used` boolean)
 - Constant-time response (always 200 on forgot-password regardless of email existence)
 - **Rate limiting:** Maximum 3 forgot-password requests per account per hour. In `AuthService.forgotPassword()`, check `passwordResetTokenRepository.countByAccountAndCreatedAtAfter(account, Instant.now().minus(Duration.ofHours(1)))` — reject with 200 (same constant-time response) if >= 3. Production deployment should add IP-based rate limiting at the reverse proxy layer (nginx/CloudFlare).
+- **Constant-time execution:** The forgot-password code path must execute in consistent time regardless of whether the account exists. If the account is not found, perform a dummy operation (e.g., compute a SHA-256 hash) to match the timing of the token-creation path. This prevents account enumeration via response timing.
 
 Email sending: uses `EmailService` interface (implemented in Task 14).
 
@@ -426,7 +427,7 @@ public class EmailVerificationToken {
 
 **Step 3: Implement**
 
-Same token spec as password reset. On registration, create EmailVerificationToken and send email via `EmailService`. `POST /api/v1/auth/verify-email` accepts token, marks `email_verified = true`.
+Same token spec as password reset. On registration, create EmailVerificationToken and send email via `EmailService`. `POST /api/v1/auth/verify-email` accepts token, marks `email_verified = true`. When creating a new verification token, invalidate (delete or mark as used) any existing unused tokens for the same account to prevent token accumulation.
 
 **Step 4: Run tests, verify pass**
 
@@ -504,7 +505,7 @@ Key logic:
 
 `ImageController`:
 - `POST /api/v1/posts/{postId}/images` — AUTHOR or ADMIN, multipart upload
-- `GET /api/v1/images/{id}` — serves image with `Content-Disposition: inline`, `Content-Length`, `X-Content-Type-Options: nosniff`, and `Cache-Control` headers. Do NOT serve the upload directory as a static resource — always proxy through this controller.
+- `GET /api/v1/images/{id}` — serves image with `Content-Disposition: inline`, `Content-Length`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'`, and `Cache-Control` headers. Set `Content-Type` from the MIME type stored at upload time (Tika-validated), never from request parameters or file extension. Before serving, resolve the stored file path and verify it starts with the canonical upload directory path (`uploadDir.toPath().toRealPath()`) — reject any path that escapes the sandbox. Do NOT serve the upload directory as a static resource — always proxy through this controller.
 - `DELETE /api/v1/images/{id}` — owner or admin
 
 <!-- TODO: Add ClamAV/antivirus scanning integration for production deployment (Phase 4+) -->
@@ -674,6 +675,8 @@ Add batched native delete queries to repositories (PostgreSQL-compatible syntax)
 
 Note: Uses `DELETE ... WHERE id IN (SELECT id ... LIMIT)` subquery for PostgreSQL compatibility (PostgreSQL does not support `LIMIT` directly on `DELETE`).
 
+<!-- Note: For multi-instance deployments, add ShedLock or equivalent distributed lock to prevent redundant concurrent execution of scheduled jobs. -->
+
 **Step 3: Run tests, verify pass**
 
 **Step 4: Commit**
@@ -710,15 +713,11 @@ public class OpenApiConfig {
         return new OpenAPI()
                 .info(new Info()
                         .title("Blog Platform API")
-                        .description("REST API for the Blog Platform")
-                        .version("1.0"))
-                .components(new Components()
-                        .addSecuritySchemes("bearer-jwt",
-                                new SecurityScheme()
-                                        .type(SecurityScheme.Type.HTTP)
-                                        .scheme("bearer")
-                                        .bearerFormat("JWT")))
-                .addSecurityItem(new SecurityRequirement().addList("bearer-jwt"));
+                        .description("REST API for the Blog Platform. "
+                                + "Authentication is session-based. To authenticate in Swagger UI, "
+                                + "call POST /api/v1/auth/login first — the browser will store the "
+                                + "session cookie and subsequent requests will carry it automatically.")
+                        .version("1.0"));
     }
 }
 ```
@@ -727,7 +726,9 @@ public class OpenApiConfig {
 
 Run: `cd backend && ./gradlew bootRun`
 Open: `http://localhost:8080/swagger-ui.html`
-Expected: Swagger UI shows all endpoints grouped by controller, with an "Authorize" button for Bearer JWT.
+Expected: Swagger UI shows all endpoints grouped by controller. Authentication works by calling the login endpoint first via "Try it out."
+
+<!-- Production hardening: Restrict /swagger-ui/** and /v3/api-docs/** to dev/test profiles in SecurityConfig. /actuator/health is acceptable in production. -->
 
 **Step 3: Commit**
 
@@ -812,6 +813,15 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 ---
 
 ## Changelog
+
+### v4.0 (2026-03-15) — Per security-audit-1
+
+- **Task 12:** Added max page size enforcement (50) on `GET /api/v1/notifications`.
+- **Task 15:** Added constant-time execution note — perform dummy operation when account not found to prevent enumeration via timing.
+- **Task 16:** Added token invalidation — creating a new verification token invalidates previous unused tokens for the same account.
+- **Task 17:** Added `Content-Security-Policy: default-src 'none'` header to image responses. Set `Content-Type` from stored Tika-validated MIME type. Added path sandboxing — verify resolved file path stays within canonical upload directory before serving.
+- **Task 20:** Added ShedLock note for multi-instance deployments.
+- **Task 21:** Replaced Bearer JWT security scheme with session-based auth description (application uses session auth, not JWT). Added production hardening note to restrict Swagger UI to dev/test profiles.
 
 ### v3.0 (2026-03-15) — Per critical-review-2
 
