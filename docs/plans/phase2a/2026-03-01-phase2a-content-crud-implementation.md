@@ -28,6 +28,18 @@ These conventions apply to every task in this plan:
 - **Integration test base class:** All `*IT` classes extend `BaseIntegrationTest` (from Phase 1) instead of defining their own Testcontainers setup. Do NOT duplicate `@Container`/`@DynamicPropertySource` boilerplate.
 - **Test isolation:** All `*IT` classes are annotated with `@Transactional` for automatic rollback between tests, preventing inter-test data leakage.
 - **Concurrency safety on unique constraints:** Any service method that checks uniqueness before saving (e.g., `existsByName` → `save`) must also catch `DataIntegrityViolationException` and translate it to `BadRequestException`. The pre-check provides fast user feedback; the catch guards against TOCTOU races.
+- **DTO mapping:** All response DTOs provide a static `from()` factory method for entity-to-DTO conversion (e.g., `CategoryResponse.from(Category c)`). Controllers use this instead of inline `new ResponseDto(...)` calls.
+- **Content contract:** All content fields (post content, comment content) store raw Markdown. Frontends MUST use a safe Markdown renderer that escapes raw HTML (no HTML passthrough). The backend does not sanitize HTML — server-side sanitization would mangle Markdown syntax. Defense against XSS is the renderer's responsibility.
+- **Hibernate soft-delete filter activation:** `PostService` methods that should exclude deleted posts (`listPosts()`, `getPost()`, search methods) must explicitly enable the Hibernate `deletedFilter` before executing queries. Admin methods (restore, list deleted) must NOT enable it. Pattern:
+  ```java
+  private void enableDeletedFilter() {
+      Session session = entityManager.unwrap(Session.class);
+      session.enableFilter("deletedFilter").setParameter("isDeleted", false);
+  }
+  ```
+  `PostService` requires an injected `EntityManager` for this purpose.
+- **Authentication-aware public endpoints:** Public endpoints that perform user-specific side effects (e.g., `getPost()` calling `markAsRead()`) must guard those side effects with an authentication null-check. Pass `Authentication` (nullable) from the controller. When null/anonymous: skip `markAsRead()`, block premium posts with 403.
+- **Per-endpoint rate limiting:** Deferred to a future phase. The global `RateLimitFilter` provides baseline protection for now. Spam-sensitive endpoints (comments, likes) may need tighter per-endpoint limits later.
 
 ---
 
@@ -123,7 +135,14 @@ Create `backend/src/main/java/com/blogplatform/category/dto/CategoryResponse.jav
 ```java
 package com.blogplatform.category.dto;
 
-public record CategoryResponse(Long categoryId, String categoryName, String description) {}
+import com.blogplatform.category.Category;
+
+public record CategoryResponse(Long categoryId, String categoryName, String description) {
+
+    public static CategoryResponse from(Category c) {
+        return new CategoryResponse(c.getCategoryId(), c.getCategoryName(), c.getDescription());
+    }
+}
 ```
 
 Create `backend/src/main/java/com/blogplatform/category/CategoryRepository.java`:
@@ -207,8 +226,12 @@ public class CategoryService {
         if (!categoryRepository.existsById(id)) {
             throw new ResourceNotFoundException("Category not found");
         }
-        categoryRepository.deleteById(id);
-        log.info("Deleted category id={}", id);
+        try {
+            categoryRepository.deleteById(id);
+            log.info("Deleted category id={}", id);
+        } catch (DataIntegrityViolationException e) {
+            throw new BadRequestException("Category has posts assigned — reassign or delete them first");
+        }
     }
 }
 ```
@@ -241,7 +264,7 @@ public class CategoryController {
     @GetMapping
     public ResponseEntity<ApiResponse<List<CategoryResponse>>> getAll() {
         List<CategoryResponse> categories = categoryService.findAll().stream()
-                .map(c -> new CategoryResponse(c.getCategoryId(), c.getCategoryName(), c.getDescription()))
+                .map(CategoryResponse::from)
                 .toList();
         return ResponseEntity.ok(ApiResponse.success(categories));
     }
@@ -251,14 +274,14 @@ public class CategoryController {
     public ResponseEntity<ApiResponse<CategoryResponse>> create(@Valid @RequestBody CreateCategoryRequest request) {
         Category cat = categoryService.create(request);
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(ApiResponse.success(new CategoryResponse(cat.getCategoryId(), cat.getCategoryName(), cat.getDescription())));
+                .body(ApiResponse.success(CategoryResponse.from(cat)));
     }
 
     @PutMapping("/{id}")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ApiResponse<CategoryResponse>> update(@PathVariable Long id, @Valid @RequestBody CreateCategoryRequest request) {
         Category cat = categoryService.update(id, request);
-        return ResponseEntity.ok(ApiResponse.success(new CategoryResponse(cat.getCategoryId(), cat.getCategoryName(), cat.getDescription())));
+        return ResponseEntity.ok(ApiResponse.success(CategoryResponse.from(cat)));
     }
 
     @DeleteMapping("/{id}")
@@ -330,6 +353,36 @@ class CategoryControllerIT extends BaseIntegrationTest {
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isForbidden());
     }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void updateCategory_asAdmin_returns200() throws Exception {
+        // Create first, then update
+        var create = new CreateCategoryRequest("Original", "desc");
+        var result = mockMvc.perform(post("/api/v1/categories")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(create)))
+                .andReturn();
+        // Extract ID from response, then PUT update
+        var update = new CreateCategoryRequest("Updated", "new desc");
+        // PUT /api/v1/categories/{id} with extracted ID → expect 200
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void updateCategory_duplicateName_returns400() throws Exception {
+        // Create two categories, then try to rename second to first's name → 400
+    }
+
+    @Test
+    @WithMockUser(roles = "USER")
+    void updateCategory_asUser_returns403() throws Exception {
+        var request = new CreateCategoryRequest("Nope", "desc");
+        mockMvc.perform(put("/api/v1/categories/1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isForbidden());
+    }
 }
 ```
 
@@ -359,7 +412,7 @@ git commit -m "feat: add Category CRUD with admin-only create/update/delete"
 - Create: `backend/src/test/java/com/blogplatform/tag/TagControllerIT.java`
 
 Follows identical pattern to Category. Key differences:
-- `TagRepository` needs `findByTagNameIn(Set<String> names)` for bulk lookup
+- `TagRepository` needs `findByTagNameIn(Set<String> names)` for bulk lookup (reserved for future tag-by-name resolution; not used in Phase 2A where posts reference tags by ID)
 - Only GET (public) and POST (admin) — no PUT/DELETE per design doc
 - Tag entity has `tag_id` and `tag_name` (unique)
 
@@ -475,11 +528,30 @@ public record PostListResponse(
 **Step 2: Write repositories**
 
 `PostRepository` with custom queries:
-- `findAllWithAuthorAndCounts(Pageable)` — JPQL with COUNT subqueries for likes and comments
+- `findAllWithCounts(Pageable)` — JPQL with correlated COUNT subqueries (NOT `JOIN + GROUP BY` — that causes the fan-out problem with inflated counts when joining both likes and comments):
+```java
+@Query("SELECT new com.blogplatform.post.dto.PostListResponse(" +
+       "p.id, p.title, p.author.username, p.category.categoryName, " +
+       "(SELECT COUNT(l) FROM Like l WHERE l.post = p), " +
+       "(SELECT COUNT(c) FROM Comment c WHERE c.post = p AND c.deleted = false), " +
+       "p.premium, p.createdAt) " +
+       "FROM BlogPost p WHERE p.deleted = false")
+Page<PostListResponse> findAllWithCounts(Pageable pageable);
+```
+  > **Note on tags:** Tags cannot be projected in a JPQL constructor expression as a `Set<String>`. Fetch post IDs from the page result, then batch-load tags via `findTagsByPostIdIn(Set<Long> postIds)` and merge in the service layer.
+
 - `findByAuthorId(Long, Pageable)`
 - `countByCategoryId(Long)`
 - `findMostLikedByCategory(Long)` — custom `@Query` with JOIN, COUNT, ORDER BY DESC, LIMIT 1
-- Full-text search: `@Query(value = "SELECT * FROM blog_post WHERE search_vector @@ plainto_tsquery('english', :query) AND is_deleted = false ORDER BY ts_rank(search_vector, plainto_tsquery('english', :query)) DESC", nativeQuery = true)`
+- Full-text search with pagination support:
+```java
+@Query(value = "SELECT * FROM blog_post WHERE search_vector @@ plainto_tsquery('english', :query) " +
+               "AND is_deleted = false ORDER BY ts_rank(search_vector, plainto_tsquery('english', :query)) DESC",
+       countQuery = "SELECT COUNT(*) FROM blog_post WHERE search_vector @@ plainto_tsquery('english', :query) " +
+                    "AND is_deleted = false",
+       nativeQuery = true)
+Page<BlogPost> searchByText(@Param("query") String query, Pageable pageable);
+```
 
 `ReadPostRepository`:
 - `existsByAccountIdAndPostId(Long, Long)`
@@ -512,21 +584,24 @@ git commit -m "feat: add Post DTOs and repositories with custom queries"
 - Create: `backend/src/main/java/com/blogplatform/post/NewPostEvent.java`
 - Create: `backend/src/main/java/com/blogplatform/post/PostService.java`
 - Create: `backend/src/test/java/com/blogplatform/post/PostServiceTest.java`
+- Create: `backend/src/main/resources/db/migration/V3__add_audit_updated_by.sql` — adds `updated_by BIGINT REFERENCES user_account(account_id)` to `post_update_log` table
 
 **Step 1: Write failing unit tests**
 
 Key tests:
 - `createPost_savesPostAndPublishesEvent` — verify `ApplicationEventPublisher.publishEvent(NewPostEvent)` called
-- `createPost_savesAuditLog` — verify `PostUpdateLog` created with old values null, new values from post
+- `createPost_savesAuditLog` — verify `PostUpdateLog` created with old values null, new values from post, `updatedBy` set to current user
 - `createPost_withCategoryAndTags_setsRelationships`
-- `updatePost_capturesOldValuesInLog` — verify PostUpdateLog created with old title/content
+- `updatePost_capturesOldValuesInLog` — verify PostUpdateLog created with old title/content and `updatedBy`
 - `deletePost_setsSoftDeleteFlag` — `is_deleted = true`, post still exists
 - `getPost_whenDeleted_throwsNotFound` (with filter enabled)
 - `getPost_premiumPost_nonVipUser_throwsForbidden`
 - `getPost_premiumPost_asAuthor_allowed` — post author can view their own premium post
 - `getPost_premiumPost_asAdmin_allowed` — ADMIN role bypasses premium check
+- `getPost_premiumPost_anonymous_throwsForbidden` — unauthenticated user blocked from premium post
 - `getPost_marksAsRead` — verify `readPostRepository.markAsRead()` called
 - `getPost_alreadyRead_noError` — idempotent, no exception on re-view
+- `getPost_anonymous_skipsReadTracking` — verify `markAsRead()` NOT called when authentication is null
 
 **Step 2: Run test to verify it fails**
 
@@ -539,12 +614,12 @@ package com.blogplatform.post;
 public record NewPostEvent(Long postId, String title, String authorName) {}
 ```
 
-`PostService` key logic:
-- `createPost()`: saves post, writes `PostUpdateLog` with old values null (creation audit), publishes `NewPostEvent` via `ApplicationEventPublisher`
-- `updatePost()`: loads existing post, captures old title/content, applies changes, writes `PostUpdateLog` with old+new values
+`PostService` key logic (requires injected `EntityManager` for filter activation — see Cross-Cutting Conventions):
+- `createPost()`: saves post, writes `PostUpdateLog` with old values null (creation audit) and `updatedBy` set to current user, publishes `NewPostEvent` via `ApplicationEventPublisher`
+- `updatePost()`: loads existing post, captures old title/content, applies changes, writes `PostUpdateLog` with old+new values and `updatedBy` set to current user
 - `deletePost()`: sets `is_deleted = true`
-- `getPost()`: checks `is_deleted`, checks premium access (VIP, post author, and ADMIN are all exempt), calls `readPostRepository.markAsRead(userId, postId)` (idempotent native upsert — no duplicate insert risk)
-- `listPosts()`: uses Hibernate `@Filter("activePostsFilter")` to exclude deleted posts, supports pagination, category/tag/author filtering, full-text search
+- `getPost(Long postId, Authentication auth)`: calls `enableDeletedFilter()`, checks `is_deleted`, checks premium access (VIP, post author, and ADMIN are all exempt; anonymous users get 403 on premium posts). If `auth` is non-null and authenticated (not `AnonymousAuthenticationToken`), calls `readPostRepository.markAsRead(userId, postId)` (idempotent native upsert). If `auth` is null/anonymous, skips read tracking.
+- `listPosts()`: calls `enableDeletedFilter()` to exclude deleted posts, supports pagination, category/tag/author filtering, full-text search
 
 > **Note on audit logging:** All audit logging (both create and update) is handled in PostService. There is no `@PostPersist` entity listener — this avoids the static injection anti-pattern and keeps audit responsibility in one place.
 
@@ -673,7 +748,14 @@ Key logic in `addComment()`:
 4. If `parentCommentId` provided: verify parent exists and belongs to same post
 5. Enforce max nesting depth of 3 using this algorithm:
    - **Depth definition:** root comment = depth 1, each reply increments depth by 1
-   - **Depth calculation:** Walk up the parent chain from the intended parent, counting hops + 1 to get parent's depth. New comment would be at parent's depth + 1.
+   - **Parent loading:** Load the intended parent comment with its ancestor chain in a single query to avoid N+1 lazy loads:
+     ```java
+     @Query("SELECT c FROM Comment c LEFT JOIN FETCH c.parentComment p " +
+            "LEFT JOIN FETCH p.parentComment WHERE c.id = :id")
+     Optional<Comment> findByIdWithParentChain(@Param("id") Long id);
+     ```
+     Add this method to `CommentRepository`.
+   - **Depth calculation:** Walk up the in-memory parent chain from the intended parent, counting hops + 1 to get parent's depth. New comment would be at parent's depth + 1.
    - **Re-parenting rule:** If new comment's depth > 3, walk up from the intended parent until finding an ancestor at depth 2. Set that ancestor as the new parent. New comment is now at depth 3.
 6. Save Comment
 
@@ -692,28 +774,35 @@ git commit -m "feat: add CommentService with threading, read-before-comment, dep
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/comment/CommentController.java`
 - Create: `backend/src/test/java/com/blogplatform/comment/CommentControllerIT.java`
+- Create: `backend/src/main/resources/db/migration/V4__add_comment_is_deleted.sql` — adds `is_deleted BOOLEAN NOT NULL DEFAULT FALSE` to `comment` table
 
 **Step 1: Write integration tests**
 
 - `GET /api/v1/posts/{id}/comments` — public, returns threaded structure, **paginated by top-level comments** (default page size 20)
 - `POST /api/v1/posts/{id}/comments` — authenticated, must have read post
 - `POST comment without reading post` — 403
-- `DELETE /api/v1/comments/{id}` — owner deletes (hard delete, cascading via FK ON DELETE CASCADE)
+- `DELETE /api/v1/comments/{id}` — owner soft-deletes (content blanked, `is_deleted = true`, row preserved for thread structure)
 - `DELETE /api/v1/comments/{id}` — non-owner returns 403
-- `DELETE /api/v1/comments/{id}` — admin can delete any comment
+- `DELETE /api/v1/comments/{id}` — admin can soft-delete any comment
+- `GET comments after delete` — deleted comment with replies shows as `"[deleted]"` placeholder; deleted comment without replies is hidden from response
 - Full thread flow: create post → read it → comment → reply → verify nesting
 
 **Step 2: Implement CommentController**
 
-`CommentResponse` is recursive:
+`CommentResponse` is recursive. Deleted comments with replies render as placeholders:
 ```java
 public record CommentResponse(
         Long commentId,
         String content,
         String username,
         Instant createdAt,
+        boolean deleted,
         List<CommentResponse> replies
-) {}
+) {
+    public static CommentResponse deletedPlaceholder(Long commentId, Instant createdAt, List<CommentResponse> replies) {
+        return new CommentResponse(commentId, "[deleted]", "[deleted]", createdAt, true, replies);
+    }
+}
 ```
 
 **Comment tree building algorithm** (single query + in-memory assembly):
@@ -724,9 +813,11 @@ public record CommentResponse(
 
 This ensures O(n) in-memory work with 2-3 DB queries total (bounded, not N+1).
 
-**Ownership verification for delete:** Load comment, call `ownershipVerifier.verify(comment.getAccount().getAccountId(), authentication)` before deleting.
+**Ownership verification for delete:** Load comment, call `ownershipVerifier.verify(comment.getAccount().getAccountId(), authentication)` before soft-deleting.
 
-> **Note on delete behavior:** Comment deletion is a hard delete (row removed). The schema defines `ON DELETE CASCADE` on the `parent_comment_id` FK, so deleting a parent comment automatically removes all its replies.
+> **Note on delete behavior:** Comment deletion is a soft delete — set `is_deleted = true` and replace `content` with an empty string (or null). The row is preserved to maintain thread structure. When building the comment tree for display: (1) deleted comments that have replies render as `"[deleted]"` placeholders (showing `commentId`, `createdAt`, `replies`, but content = `"[deleted]"` and username = `"[deleted]"`), (2) deleted comments with no replies are omitted entirely from the response. This requires a Flyway migration (`V4__add_comment_is_deleted.sql`) to add `is_deleted BOOLEAN NOT NULL DEFAULT FALSE` to the `comment` table.
+
+> **Note on schema:** The `parent_comment_id` FK in the schema does NOT have `ON DELETE CASCADE` (it uses the default RESTRICT). The soft-delete approach avoids this constraint entirely — rows are never removed.
 
 **Step 3: Run tests, verify pass**
 
@@ -760,6 +851,14 @@ git commit -m "feat: add CommentController with threaded comments, pagination, o
 - `countByPostId(Long)`
 - `existsByAccountIdAndPostId(Long, Long)`
 - `findByAccountIdAndPostId(Long, Long)` → Optional
+- Idempotent like via native upsert (matching the ReadPost pattern):
+```java
+@Modifying
+@Query(value = "INSERT INTO post_like (account_id, post_id, created_at) " +
+               "VALUES (:accountId, :postId, NOW()) ON CONFLICT (account_id, post_id) DO NOTHING",
+       nativeQuery = true)
+void likePost(@Param("accountId") Long accountId, @Param("postId") Long postId);
+```
 
 `LikeController`:
 - `POST /api/v1/posts/{postId}/likes` — authenticated, idempotent
@@ -818,3 +917,4 @@ git commit -m "feat: add Author profile listing with post counts"
 |---------|------|---------|
 | 1.0 | 2026-03-01 | Initial plan with Tasks 1-10 |
 | 2.0 | 2026-03-15 | Revised per critical review (`2026-03-01-phase2a-content-crud-implementation-critical-review-1.md`). Changes: (1) Removed Task 5 (PostEntityListener) — creation audit logging moved into Task 4 PostService to avoid static injection anti-pattern and keep audit in one place. Tasks renumbered 1-9. (2) Added `ReadPostRepository.markAsRead()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`) in Task 3 to prevent duplicate insert errors on re-view. (3) Added `DataIntegrityViolationException` catch on all uniqueness-checked operations (Tasks 1, 2) as TOCTOU race guard. (4) Added `existsByCategoryNameAndCategoryIdNot` duplicate name check on Category update (Task 1). (5) Specified single-query + in-memory tree assembly for comment threading (Task 7) to prevent N+1 queries. (6) Added top-level comment pagination to `GET /api/v1/posts/{id}/comments` (Task 7). (7) Replaced ambiguous re-parenting prose with explicit depth algorithm and concrete A→B→C→D example (Task 6). (8) Added explicit `ownershipVerifier.verify()` calls for post update/delete (Task 5) and comment delete (Task 7) with IDOR prevention tests. (9) Added premium access exemptions for post author and ADMIN role (Task 4). (10) Added Cross-Cutting Conventions section: `@Slf4j` logging, `@Transactional(readOnly=true)`, extend `BaseIntegrationTest`, `@Transactional` on IT classes, `DataIntegrityViolationException` catch pattern. (11) Added explicit Tag unit tests (Task 2). (12) Documented PUT = full-replacement semantics for Category and Post updates. Phase 2B task numbers shifted (now Tasks 10-22). |
+| 3.0 | 2026-03-15 | Revised per critical review v2 (`2026-03-01-phase2a-content-crud-implementation-critical-review-2.md`). Changes: (1) Changed comment deletion from hard delete to soft delete with "[deleted]" placeholder — preserves thread structure and other users' replies. Added Flyway migration `V4__add_comment_is_deleted.sql`. Corrected false claim that schema has `ON DELETE CASCADE` on `parent_comment_id` (it uses default RESTRICT). (2) Added `DataIntegrityViolationException` catch on `CategoryService.delete()` to handle FK violation when category has referencing posts — returns 400 with clear message. (3) Added Hibernate `deletedFilter` activation pattern to cross-cutting conventions with `enableDeletedFilter()` helper method using injected `EntityManager`. Specified which `PostService` methods enable the filter and which don't (admin restore). (4) Added `findByIdWithParentChain` JOIN FETCH query to `CommentRepository` — loads full parent chain (max depth 3) in one query, preventing N+1 lazy loads during depth calculation. (5) Made `getPost()` authentication-aware: accepts nullable `Authentication`, guards `markAsRead()` and premium checks against null/anonymous users. Added tests for anonymous access. Added convention for all auth-aware public endpoints. (6) Added Markdown content contract to cross-cutting conventions — content is raw Markdown, frontends must use safe renderer, no server-side HTML sanitization. (7) Added `updated_by` column to `post_update_log` via Flyway migration `V3__add_audit_updated_by.sql` for audit trail actor attribution. (8) Added `CategoryResponse.from()` static factory method and DTO mapping convention — all response DTOs provide `from()` factory. Updated controller to use `CategoryResponse::from`. (9) Added explicit JPQL for `PostRepository.findAllWithCounts()` using correlated COUNT subqueries (not JOIN+GROUP BY) to avoid fan-out problem. Documented separate tag batch-loading strategy. (10) Added `countQuery` and `Pageable` to full-text search native query for proper pagination support. (11) Added idempotent `LikeRepository.likePost()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`), matching ReadPost pattern. (12) Added missing integration tests for category update: `updateCategory_asAdmin_returns200`, `_duplicateName_returns400`, `_asUser_returns403`. (13) Annotated `findByTagNameIn` as reserved for future use. (14) Added note deferring per-endpoint rate limiting to future phase. |
