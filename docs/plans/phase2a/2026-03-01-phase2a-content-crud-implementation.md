@@ -1,6 +1,6 @@
 # Phase 2A: Content & CRUD — Implementation Plan
 
-(Part 1 of 2 — Tasks 1-10 of 23)
+(Part 1 of 2 — Tasks 1-9 of 22)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -16,8 +16,18 @@
 
 ## Phase 2 Parts
 
-- **Phase 2A** (this file): Tasks 1–10 — Category, Tag, Post CRUD, Comments, Likes, Authors
-- **Phase 2B** (`2026-03-01-phase2b-platform-features-implementation.md`): Tasks 11–23 — Subscriptions, Notifications, Profiles, Password Reset, Email, Image Upload, Admin, Cleanup, OpenAPI, Integration Tests
+- **Phase 2A** (this file): Tasks 1–9 — Category, Tag, Post CRUD, Comments, Likes, Authors
+- **Phase 2B** (`2026-03-01-phase2b-platform-features-implementation.md`): Tasks 10–22 — Subscriptions, Notifications, Profiles, Password Reset, Email, Image Upload, Admin, Cleanup, OpenAPI, Integration Tests
+
+## Cross-Cutting Conventions (All Tasks)
+
+These conventions apply to every task in this plan:
+
+- **Logging:** All service classes use `@Slf4j` (Lombok). Log mutations at `info` level with entity IDs (`log.info("Created category id={}", cat.getCategoryId())`). Log business rule rejections at `warn` level (`log.warn("User {} attempted to comment on unread post {}", userId, postId)`).
+- **Read-only transactions:** All read-only service methods use `@Transactional(readOnly = true)` for dirty-checking optimization and read-replica routing readiness.
+- **Integration test base class:** All `*IT` classes extend `BaseIntegrationTest` (from Phase 1) instead of defining their own Testcontainers setup. Do NOT duplicate `@Container`/`@DynamicPropertySource` boilerplate.
+- **Test isolation:** All `*IT` classes are annotated with `@Transactional` for automatic rollback between tests, preventing inter-test data leakage.
+- **Concurrency safety on unique constraints:** Any service method that checks uniqueness before saving (e.g., `existsByName` → `save`) must also catch `DataIntegrityViolationException` and translate it to `BadRequestException`. The pre-check provides fast user feedback; the catch guards against TOCTOU races.
 
 ---
 
@@ -107,6 +117,8 @@ public record CreateCategoryRequest(
 ) {}
 ```
 
+> **Note:** `CreateCategoryRequest` is reused for PUT updates. This is intentional — PUT is a full-replacement operation, so all fields are required on update as well.
+
 Create `backend/src/main/java/com/blogplatform/category/dto/CategoryResponse.java`:
 ```java
 package com.blogplatform.category.dto;
@@ -122,6 +134,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface CategoryRepository extends JpaRepository<Category, Long> {
     boolean existsByCategoryName(String categoryName);
+    boolean existsByCategoryNameAndCategoryIdNot(String categoryName, Long categoryId);
 }
 ```
 
@@ -132,11 +145,14 @@ package com.blogplatform.category;
 import com.blogplatform.category.dto.CreateCategoryRequest;
 import com.blogplatform.common.exception.BadRequestException;
 import com.blogplatform.common.exception.ResourceNotFoundException;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
+@Slf4j
 @Service
 public class CategoryService {
 
@@ -146,6 +162,7 @@ public class CategoryService {
         this.categoryRepository = categoryRepository;
     }
 
+    @Transactional(readOnly = true)
     public List<Category> findAll() {
         return categoryRepository.findAll();
     }
@@ -158,16 +175,31 @@ public class CategoryService {
         Category category = new Category();
         category.setCategoryName(request.categoryName());
         category.setDescription(request.description());
-        return categoryRepository.save(category);
+        try {
+            Category saved = categoryRepository.save(category);
+            log.info("Created category id={} name='{}'", saved.getCategoryId(), saved.getCategoryName());
+            return saved;
+        } catch (DataIntegrityViolationException e) {
+            throw new BadRequestException("Category name already exists");
+        }
     }
 
     @Transactional
     public Category update(Long id, CreateCategoryRequest request) {
         Category category = categoryRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Category not found"));
+        if (categoryRepository.existsByCategoryNameAndCategoryIdNot(request.categoryName(), id)) {
+            throw new BadRequestException("Category name already exists");
+        }
         category.setCategoryName(request.categoryName());
         category.setDescription(request.description());
-        return categoryRepository.save(category);
+        try {
+            Category saved = categoryRepository.save(category);
+            log.info("Updated category id={} name='{}'", saved.getCategoryId(), saved.getCategoryName());
+            return saved;
+        } catch (DataIntegrityViolationException e) {
+            throw new BadRequestException("Category name already exists");
+        }
     }
 
     @Transactional
@@ -176,6 +208,7 @@ public class CategoryService {
             throw new ResourceNotFoundException("Category not found");
         }
         categoryRepository.deleteById(id);
+        log.info("Deleted category id={}", id);
     }
 }
 ```
@@ -248,39 +281,23 @@ Create `backend/src/test/java/com/blogplatform/category/CategoryControllerIT.jav
 ```java
 package com.blogplatform.category;
 
+import com.blogplatform.BaseIntegrationTest;
 import com.blogplatform.category.dto.CreateCategoryRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
 import org.springframework.security.test.context.support.WithMockUser;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
+import org.springframework.transaction.annotation.Transactional;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@SpringBootTest
 @AutoConfigureMockMvc
-@Testcontainers
-class CategoryControllerIT {
-
-    @Container
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
-
-    @DynamicPropertySource
-    static void configureProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", postgres::getJdbcUrl);
-        registry.add("spring.datasource.username", postgres::getUsername);
-        registry.add("spring.datasource.password", postgres::getPassword);
-        registry.add("spring.session.store-type", () -> "none");
-    }
+@Transactional
+class CategoryControllerIT extends BaseIntegrationTest {
 
     @Autowired
     private MockMvc mockMvc;
@@ -338,6 +355,7 @@ git commit -m "feat: add Category CRUD with admin-only create/update/delete"
 - Create: `backend/src/main/java/com/blogplatform/tag/TagController.java`
 - Create: `backend/src/main/java/com/blogplatform/tag/dto/CreateTagRequest.java`
 - Create: `backend/src/main/java/com/blogplatform/tag/dto/TagResponse.java`
+- Create: `backend/src/test/java/com/blogplatform/tag/TagServiceTest.java`
 - Create: `backend/src/test/java/com/blogplatform/tag/TagControllerIT.java`
 
 Follows identical pattern to Category. Key differences:
@@ -345,16 +363,25 @@ Follows identical pattern to Category. Key differences:
 - Only GET (public) and POST (admin) — no PUT/DELETE per design doc
 - Tag entity has `tag_id` and `tag_name` (unique)
 
-**Step 1: Write DTOs, Repository, Service, Controller** (same pattern as Task 1)
+**Step 1: Write failing unit tests**
 
-**Step 2: Write integration test** verifying:
+Create `backend/src/test/java/com/blogplatform/tag/TagServiceTest.java` with:
+- `create_withValidName_savesTag`
+- `create_withDuplicateName_throwsBadRequest` — via pre-check
+- `create_concurrentDuplicate_catchesConstraintViolation` — verify `DataIntegrityViolationException` is caught
+
+**Step 2: Write DTOs, Repository, Service, Controller** (same pattern as Task 1)
+
+`TagService.create()` must include both the `existsByTagName` pre-check and the `DataIntegrityViolationException` catch (see Cross-Cutting Conventions).
+
+**Step 3: Write integration test** (`extends BaseIntegrationTest`, `@Transactional`) verifying:
 - GET /api/v1/tags is public
 - POST /api/v1/tags requires ADMIN role
 - Duplicate tag name returns 400
 
-**Step 3: Run tests, verify pass**
+**Step 4: Run tests, verify pass**
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
 git commit -m "feat: add Tag list and admin-only create"
@@ -399,7 +426,29 @@ public record CreatePostRequest(
 ) {}
 ```
 
-`UpdatePostRequest`: Same fields, all optional (no `@NotBlank`).
+`UpdatePostRequest`: Same fields as `CreatePostRequest` with all fields required (`@NotBlank` on title and content). This is a full-replacement PUT — all fields must be provided.
+
+```java
+package com.blogplatform.post.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+import java.util.Set;
+
+public record UpdatePostRequest(
+        @NotBlank(message = "Title is required")
+        @Size(max = 255)
+        String title,
+
+        @NotBlank(message = "Content is required")
+        @Size(max = 100000, message = "Content must be at most 100,000 characters")
+        String content,
+
+        Long categoryId,
+        Set<Long> tagIds,
+        boolean isPremium
+) {}
+```
 
 `PostListResponse`:
 ```java
@@ -432,7 +481,16 @@ public record PostListResponse(
 - `findMostLikedByCategory(Long)` — custom `@Query` with JOIN, COUNT, ORDER BY DESC, LIMIT 1
 - Full-text search: `@Query(value = "SELECT * FROM blog_post WHERE search_vector @@ plainto_tsquery('english', :query) AND is_deleted = false ORDER BY ts_rank(search_vector, plainto_tsquery('english', :query)) DESC", nativeQuery = true)`
 
-`ReadPostRepository`: `existsByAccountIdAndPostId(Long, Long)`
+`ReadPostRepository`:
+- `existsByAccountIdAndPostId(Long, Long)`
+- `markAsRead(Long accountId, Long postId)` — native upsert query:
+```java
+@Modifying
+@Query(value = "INSERT INTO read_post (account_id, post_id, read_at) " +
+               "VALUES (:accountId, :postId, NOW()) ON CONFLICT DO NOTHING",
+       nativeQuery = true)
+void markAsRead(@Param("accountId") Long accountId, @Param("postId") Long postId);
+```
 
 `SavedPostRepository`: `findByAccountId(Long, Pageable)`
 
@@ -448,7 +506,7 @@ git commit -m "feat: add Post DTOs and repositories with custom queries"
 
 ---
 
-### Task 4: PostService — Create with Notification Event
+### Task 4: PostService — Create with Notification Event and Audit Logging
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/post/NewPostEvent.java`
@@ -459,12 +517,16 @@ git commit -m "feat: add Post DTOs and repositories with custom queries"
 
 Key tests:
 - `createPost_savesPostAndPublishesEvent` — verify `ApplicationEventPublisher.publishEvent(NewPostEvent)` called
+- `createPost_savesAuditLog` — verify `PostUpdateLog` created with old values null, new values from post
 - `createPost_withCategoryAndTags_setsRelationships`
 - `updatePost_capturesOldValuesInLog` — verify PostUpdateLog created with old title/content
 - `deletePost_setsSoftDeleteFlag` — `is_deleted = true`, post still exists
 - `getPost_whenDeleted_throwsNotFound` (with filter enabled)
 - `getPost_premiumPost_nonVipUser_throwsForbidden`
-- `getPost_marksAsRead` — verify ReadPost created
+- `getPost_premiumPost_asAuthor_allowed` — post author can view their own premium post
+- `getPost_premiumPost_asAdmin_allowed` — ADMIN role bypasses premium check
+- `getPost_marksAsRead` — verify `readPostRepository.markAsRead()` called
+- `getPost_alreadyRead_noError` — idempotent, no exception on re-view
 
 **Step 2: Run test to verify it fails**
 
@@ -478,77 +540,27 @@ public record NewPostEvent(Long postId, String title, String authorName) {}
 ```
 
 `PostService` key logic:
-- `createPost()`: saves post, publishes `NewPostEvent` via `ApplicationEventPublisher`
+- `createPost()`: saves post, writes `PostUpdateLog` with old values null (creation audit), publishes `NewPostEvent` via `ApplicationEventPublisher`
 - `updatePost()`: loads existing post, captures old title/content, applies changes, writes `PostUpdateLog` with old+new values
 - `deletePost()`: sets `is_deleted = true`
-- `getPost()`: checks `is_deleted`, checks premium access (VIP only), creates `ReadPost` entry
+- `getPost()`: checks `is_deleted`, checks premium access (VIP, post author, and ADMIN are all exempt), calls `readPostRepository.markAsRead(userId, postId)` (idempotent native upsert — no duplicate insert risk)
 - `listPosts()`: uses Hibernate `@Filter("activePostsFilter")` to exclude deleted posts, supports pagination, category/tag/author filtering, full-text search
+
+> **Note on audit logging:** All audit logging (both create and update) is handled in PostService. There is no `@PostPersist` entity listener — this avoids the static injection anti-pattern and keeps audit responsibility in one place.
+
+> **Note on premium access:** The premium check in `getPost()` exempts three cases: (1) the post's own author, (2) users with ADMIN role, (3) users with VIP status. All others receive 403 Forbidden. List endpoints (`listPosts()`) include premium posts in results with the `isPremium` flag set — the `PostListResponse` does not contain full content, so no content is leaked.
 
 **Step 4: Run tests, verify pass**
 
 **Step 5: Commit**
 
 ```bash
-git commit -m "feat: add PostService with CRUD, soft delete, read tracking, premium access"
+git commit -m "feat: add PostService with CRUD, soft delete, audit logging, read tracking, premium access"
 ```
 
 ---
 
-### Task 5: PostEntityListener — Audit Logging on Create
-
-**Files:**
-- Create: `backend/src/main/java/com/blogplatform/post/PostEntityListener.java`
-- Create: `backend/src/test/java/com/blogplatform/post/PostEntityListenerTest.java`
-
-**Step 1: Write failing test**
-
-Test that `@PostPersist` creates a `PostUpdateLog` entry with the new post's title and content (old values null).
-
-**Step 2: Implement PostEntityListener**
-
-```java
-package com.blogplatform.post;
-
-import jakarta.persistence.PostPersist;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
-
-@Component
-public class PostEntityListener {
-
-    private static PostUpdateLogRepository logRepository;
-
-    @Autowired
-    public void setLogRepository(PostUpdateLogRepository logRepository) {
-        PostEntityListener.logRepository = logRepository;
-    }
-
-    @PostPersist
-    public void postPersist(BlogPost post) {
-        PostUpdateLog log = new PostUpdateLog();
-        log.setPostId(post.getPostId());
-        log.setOldTitle(null);
-        log.setNewTitle(post.getTitle());
-        log.setOldContent(null);
-        log.setNewContent(post.getContent());
-        logRepository.save(log);
-    }
-}
-```
-
-Note: Add `@EntityListeners(PostEntityListener.class)` to `BlogPost.java`.
-
-**Step 3: Run test, verify pass**
-
-**Step 4: Commit**
-
-```bash
-git commit -m "feat: add PostEntityListener for audit logging on post creation"
-```
-
----
-
-### Task 6: PostController — Full CRUD + Save/Unsave
+### Task 5: PostController — Full CRUD + Save/Unsave
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/post/PostController.java`
@@ -563,7 +575,10 @@ Key tests:
 - `POST /api/v1/posts` — AUTHOR role creates post, returns 201
 - `POST /api/v1/posts` — USER role returns 403
 - `PUT /api/v1/posts/{id}` — owner updates, verify PostUpdateLog written
+- `PUT /api/v1/posts/{id}` — non-owner returns 403 (IDOR prevention)
 - `DELETE /api/v1/posts/{id}` — owner soft-deletes, post gone from listings
+- `DELETE /api/v1/posts/{id}` — non-owner returns 403 (IDOR prevention)
+- `DELETE /api/v1/posts/{id}` — ADMIN can delete any post
 - `POST /api/v1/posts/{id}/save` — authenticated bookmarks post
 - `DELETE /api/v1/posts/{id}/save` — remove bookmark
 - `GET /api/v1/posts?page=0&size=10` — verify pagination metadata
@@ -572,10 +587,10 @@ Key tests:
 
 Endpoints per design doc Section 5:
 - `GET /api/v1/posts` — public, paginated, filterable
-- `GET /api/v1/posts/{id}` — public (premium → VIP only), marks as read
+- `GET /api/v1/posts/{id}` — public (premium → VIP/author/admin only), marks as read
 - `POST /api/v1/posts` — `@PreAuthorize("hasAnyRole('AUTHOR', 'ADMIN')")`
-- `PUT /api/v1/posts/{id}` — owner or admin (use `@ownershipVerifier`)
-- `DELETE /api/v1/posts/{id}` — owner or admin
+- `PUT /api/v1/posts/{id}` — load post via service, call `ownershipVerifier.verify(post.getAuthor().getAccountId(), authentication)`, then proceed with update
+- `DELETE /api/v1/posts/{id}` — load post via service, call `ownershipVerifier.verify(post.getAuthor().getAccountId(), authentication)`, then proceed with soft delete
 - `POST /api/v1/posts/{id}/save` — authenticated
 - `DELETE /api/v1/posts/{id}/save` — authenticated
 
@@ -591,7 +606,7 @@ git commit -m "feat: add PostController with CRUD, filtering, search, save/unsav
 
 ---
 
-### Task 7: Comment System — Service with Threading and Nesting Depth
+### Task 6: Comment System — Service with Threading and Nesting Depth
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/comment/CommentRepository.java`
@@ -626,10 +641,21 @@ void addComment_parentCommentOnDifferentPost_throwsBadRequest() {
 
 @Test
 void addComment_atDepth4_reparentsToDepth3() {
-    // Comment chain: A → B → C (depth 3). Reply to C should be re-parented to C (stays at depth 3)
-    // Walk parent chain: C's parent is B, B's parent is A, A has no parent → depth=3
-    // Since depth exceeds 3, re-parent to deepest allowed ancestor (C at depth 3? No — re-parent to B)
-    // Actually per design: "walk up parent chain, if depth exceeds 3, re-parent to the deepest allowed ancestor"
+    // Depth is 1-indexed: root = depth 1, reply to root = depth 2, reply to depth-2 = depth 3 (max).
+    //
+    // Example: A(depth 1) → B(depth 2) → C(depth 3). User replies to C.
+    // Without re-parenting, new comment D would be at depth 4 (exceeds max of 3).
+    // Algorithm: walk up from C. C's parent is B (depth 2). Re-parent D to B.
+    // Result: D is at depth 3, a sibling of C under B.
+    //
+    // Verify: saved comment's parentCommentId == B's commentId
+}
+
+@Test
+void addComment_atDepth3_noReparenting() {
+    // A(depth 1) → B(depth 2). User replies to B.
+    // New comment C would be at depth 3 (within max). No re-parenting needed.
+    // Verify: saved comment's parentCommentId == B's commentId (unchanged)
 }
 
 @Test
@@ -645,7 +671,10 @@ Key logic in `addComment()`:
 2. Check `ReadPost` exists for (userId, postId) → 403 if not
 3. Validate content ≤ 250 chars (Bean Validation)
 4. If `parentCommentId` provided: verify parent exists and belongs to same post
-5. Enforce max nesting depth of 3: walk up parent chain counting depth. If > 3, set parent to the deepest ancestor at depth 2 (so the new comment is at depth 3)
+5. Enforce max nesting depth of 3 using this algorithm:
+   - **Depth definition:** root comment = depth 1, each reply increments depth by 1
+   - **Depth calculation:** Walk up the parent chain from the intended parent, counting hops + 1 to get parent's depth. New comment would be at parent's depth + 1.
+   - **Re-parenting rule:** If new comment's depth > 3, walk up from the intended parent until finding an ancestor at depth 2. Set that ancestor as the new parent. New comment is now at depth 3.
 6. Save Comment
 
 **Step 3: Run tests, verify pass**
@@ -658,7 +687,7 @@ git commit -m "feat: add CommentService with threading, read-before-comment, dep
 
 ---
 
-### Task 8: CommentController + Integration Tests
+### Task 7: CommentController + Integration Tests
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/comment/CommentController.java`
@@ -666,10 +695,12 @@ git commit -m "feat: add CommentService with threading, read-before-comment, dep
 
 **Step 1: Write integration tests**
 
-- `GET /api/v1/posts/{id}/comments` — public, returns threaded structure
+- `GET /api/v1/posts/{id}/comments` — public, returns threaded structure, **paginated by top-level comments** (default page size 20)
 - `POST /api/v1/posts/{id}/comments` — authenticated, must have read post
 - `POST comment without reading post` — 403
-- `DELETE /api/v1/comments/{id}` — owner or admin
+- `DELETE /api/v1/comments/{id}` — owner deletes (hard delete, cascading via FK ON DELETE CASCADE)
+- `DELETE /api/v1/comments/{id}` — non-owner returns 403
+- `DELETE /api/v1/comments/{id}` — admin can delete any comment
 - Full thread flow: create post → read it → comment → reply → verify nesting
 
 **Step 2: Implement CommentController**
@@ -685,19 +716,29 @@ public record CommentResponse(
 ) {}
 ```
 
-Controller builds threaded response by fetching top-level comments and recursively attaching replies.
+**Comment tree building algorithm** (single query + in-memory assembly):
+1. Fetch paginated top-level comments: `findByPostIdAndParentCommentIdIsNull(postId, pageable)` — returns `Page<Comment>` of top-level comments
+2. Collect the IDs of the returned top-level comments
+3. Fetch all descendants in one query: `findByPostIdAndParentCommentIdIn(postId, topLevelIds)` — this gets depth-2 comments. Repeat for depth-3 using the depth-2 IDs. (Bounded by max depth 3, so exactly 2 additional queries max.)
+4. Build tree in-memory: group comments by `parentCommentId` into a `Map<Long, List<Comment>>`, then recursively attach replies to each `CommentResponse`
+
+This ensures O(n) in-memory work with 2-3 DB queries total (bounded, not N+1).
+
+**Ownership verification for delete:** Load comment, call `ownershipVerifier.verify(comment.getAccount().getAccountId(), authentication)` before deleting.
+
+> **Note on delete behavior:** Comment deletion is a hard delete (row removed). The schema defines `ON DELETE CASCADE` on the `parent_comment_id` FK, so deleting a parent comment automatically removes all its replies.
 
 **Step 3: Run tests, verify pass**
 
 **Step 4: Commit**
 
 ```bash
-git commit -m "feat: add CommentController with threaded comments"
+git commit -m "feat: add CommentController with threaded comments, pagination, ownership checks"
 ```
 
 ---
 
-### Task 9: Like/Unlike
+### Task 8: Like/Unlike
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/like/LikeRepository.java`
@@ -734,7 +775,7 @@ git commit -m "feat: add Like/unlike with idempotent toggle"
 
 ---
 
-### Task 10: Author Profiles
+### Task 9: Author Profiles
 
 **Files:**
 - Create: `backend/src/main/java/com/blogplatform/author/AuthorRepository.java`
@@ -767,4 +808,13 @@ git commit -m "feat: add Author profile listing with post counts"
 
 ---
 
-> **Continue to Phase 2B for Tasks 11-23.**
+> **Continue to Phase 2B for Tasks 10-22.**
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2026-03-01 | Initial plan with Tasks 1-10 |
+| 2.0 | 2026-03-15 | Revised per critical review (`2026-03-01-phase2a-content-crud-implementation-critical-review-1.md`). Changes: (1) Removed Task 5 (PostEntityListener) — creation audit logging moved into Task 4 PostService to avoid static injection anti-pattern and keep audit in one place. Tasks renumbered 1-9. (2) Added `ReadPostRepository.markAsRead()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`) in Task 3 to prevent duplicate insert errors on re-view. (3) Added `DataIntegrityViolationException` catch on all uniqueness-checked operations (Tasks 1, 2) as TOCTOU race guard. (4) Added `existsByCategoryNameAndCategoryIdNot` duplicate name check on Category update (Task 1). (5) Specified single-query + in-memory tree assembly for comment threading (Task 7) to prevent N+1 queries. (6) Added top-level comment pagination to `GET /api/v1/posts/{id}/comments` (Task 7). (7) Replaced ambiguous re-parenting prose with explicit depth algorithm and concrete A→B→C→D example (Task 6). (8) Added explicit `ownershipVerifier.verify()` calls for post update/delete (Task 5) and comment delete (Task 7) with IDOR prevention tests. (9) Added premium access exemptions for post author and ADMIN role (Task 4). (10) Added Cross-Cutting Conventions section: `@Slf4j` logging, `@Transactional(readOnly=true)`, extend `BaseIntegrationTest`, `@Transactional` on IT classes, `DataIntegrityViolationException` catch pattern. (11) Added explicit Tag unit tests (Task 2). (12) Documented PUT = full-replacement semantics for Category and Post updates. Phase 2B task numbers shifted (now Tasks 10-22). |
