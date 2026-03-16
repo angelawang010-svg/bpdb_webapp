@@ -1,5 +1,8 @@
 # Phase 4: Local Production Deployment (Mac) — Implementation Plan
 
+**Version:** 2.0
+**Last Updated:** 2026-03-16
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Deploy the application via Docker Compose on a personal Mac for local production use — production Dockerfiles, Docker Compose, Nginx reverse proxy (HTTP), database backups, and basic monitoring.
@@ -19,8 +22,20 @@
 **Files:**
 - Create: `Dockerfile.backend`
 - Create: `.dockerignore`
+- Modify: `backend/build.gradle` — disable plain JAR to prevent multi-JAR build conflicts
 
-**Step 1: Write .dockerignore**
+**Step 1: Disable plain JAR in build.gradle**
+
+Add to `backend/build.gradle` (after the `java` block):
+```groovy
+jar {
+    enabled = false
+}
+```
+
+This prevents Gradle from producing both a plain JAR and a fat JAR, which would break the `COPY *.jar` in the Dockerfile.
+
+**Step 2: Write .dockerignore**
 
 ```
 .git
@@ -33,9 +48,13 @@ node_modules/
 frontend/node_modules/
 backend/.gradle/
 backend/build/
+docker-compose*.yml
+Dockerfile*
+scripts/
+nginx/
 ```
 
-**Step 2: Write multi-stage Dockerfile**
+**Step 3: Write multi-stage Dockerfile**
 
 ```dockerfile
 # Stage 1: Build
@@ -43,7 +62,7 @@ FROM eclipse-temurin:21-jdk AS build
 WORKDIR /app
 COPY backend/gradle/ gradle/
 COPY backend/gradlew backend/build.gradle backend/settings.gradle ./
-RUN ./gradlew dependencies --no-daemon
+RUN ./gradlew bootJar --no-daemon -x test || true
 COPY backend/src/ src/
 RUN ./gradlew bootJar --no-daemon -x test
 
@@ -60,18 +79,18 @@ USER app
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD wget -q --spider http://localhost:8080/actuator/health || exit 1
-ENTRYPOINT ["java", "-jar", "app.jar", "--spring.profiles.active=prod"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar", "--spring.profiles.active=prod"]
 ```
 
-**Step 3: Verify build**
+**Step 4: Verify build**
 
 Run: `docker build -f Dockerfile.backend -t blog-backend .`
 Expected: Image builds successfully.
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
-git add Dockerfile.backend .dockerignore
+git add Dockerfile.backend .dockerignore backend/build.gradle
 git commit -m "feat: add production Dockerfile for Spring Boot backend"
 ```
 
@@ -98,6 +117,8 @@ FROM nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
 # Nginx config will be mounted via Docker Compose
 EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -q --spider http://localhost:80/ || exit 1
 ```
 
 **Step 2: Verify build**
@@ -127,7 +148,7 @@ git commit -m "feat: add production Dockerfile for React frontend (Nginx)"
 ```nginx
 add_header X-Frame-Options "SAMEORIGIN" always;
 add_header X-Content-Type-Options "nosniff" always;
-add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' /uploads/; connect-src 'self'; font-src 'self'; frame-ancestors 'self'" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'self'" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 ```
 
@@ -153,8 +174,12 @@ http {
 
     # Gzip compression
     gzip on;
-    gzip_types text/plain text/css application/json application/javascript text/xml;
+    gzip_vary on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;
     gzip_min_length 256;
+
+    # Upload size limit
+    client_max_body_size 10m;
 
     # Rate limiting
     limit_req_zone $binary_remote_addr zone=auth:10m rate=5r/m;
@@ -178,7 +203,8 @@ server {
     listen 80;
     server_name localhost;
 
-    include /etc/nginx/snippets/security-headers.conf;
+    # IMPORTANT: Nginx does not inherit add_header from parent blocks.
+    # Each location block MUST include security-headers.conf individually.
 
     # Auth endpoints — strict rate limiting
     location /api/v1/auth/ {
@@ -229,9 +255,8 @@ server {
 
         # Cache fingerprinted assets
         location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
-            expires 1y;
             include /etc/nginx/snippets/security-headers.conf;
-            add_header Cache-Control "public, immutable";
+            add_header Cache-Control "public, max-age=31536000, immutable";
         }
     }
 }
@@ -335,9 +360,9 @@ services:
 
   redis:
     image: redis:7
-    volumes:
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: redis-server /usr/local/etc/redis/redis.conf
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -357,31 +382,12 @@ volumes:
   uploads:
 ```
 
-**Step 2: Create Redis config file**
-
-Create `redis/redis.conf`:
-```
-requirepass ${REDIS_PASSWORD}
-```
-
-Note: The Redis password must be substituted before mounting. Create a small entrypoint wrapper or use `envsubst`. Alternatively, for simplicity on a local Mac, use the command-line approach but set the password via `REDISCLI_AUTH` env var for the healthcheck:
-
-```yaml
-  redis:
-    image: redis:7
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-    environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD}
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-```
-
-**Step 3: Verify Compose config is valid**
+**Step 2: Verify Compose config is valid**
 
 Run: `docker compose -f docker-compose.prod.yml config`
 Expected: Valid output, no errors.
 
-**Step 4: Commit**
+**Step 3: Commit**
 
 ```bash
 git add docker-compose.prod.yml
@@ -435,12 +441,13 @@ git commit -m "feat: update env example and gitignore for production"
 `scripts/backup.sh`:
 ```bash
 #!/bin/bash
-set -uo pipefail
+set -euo pipefail
 
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-DAY_OF_WEEK=$(date +%u)  # 1=Monday, 7=Sunday
-DAY_OF_MONTH=$(date +%d)
+NOW=$(date +%Y%m%d_%H%M%S_%u_%d)
+TIMESTAMP=$(echo "$NOW" | cut -d_ -f1,2)
+DAY_OF_WEEK=$(echo "$NOW" | cut -d_ -f3)   # 1=Monday, 7=Sunday
+DAY_OF_MONTH=$(echo "$NOW" | cut -d_ -f4)
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 
 mkdir -p "$BACKUP_DIR/daily" "$BACKUP_DIR/weekly" "$BACKUP_DIR/monthly"
@@ -453,9 +460,9 @@ if ! docker compose -f "$COMPOSE_FILE" exec -T postgres \
     exit 1
 fi
 
-# Verify the file is non-empty
-if [ ! -s "$BACKUP_FILE" ]; then
-    echo "ERROR: Backup file is empty at $TIMESTAMP" >&2
+# Verify backup is meaningful (> 1KB; empty gzip is ~20 bytes)
+if [ "$(stat -f%z "$BACKUP_FILE")" -lt 1024 ]; then
+    echo "ERROR: Backup file suspiciously small at $TIMESTAMP" >&2
     rm -f "$BACKUP_FILE"
     exit 1
 fi
@@ -517,6 +524,11 @@ git commit -m "feat: add database backup script with retention policy"
         <integer>3</integer>
         <key>Minute</key>
         <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/tmp/blogplatform-backup.log</string>
@@ -613,6 +625,35 @@ Phase 4 delivers (8 tasks):
 - Local smoke test
 
 **Deployment:** `cp .env.example .env`, edit passwords, `docker compose -f docker-compose.prod.yml up -d`.
+
+---
+
+## Changelog
+
+### v2.0 (2026-03-16) — Post critical implementation review
+
+Addresses all issues from `2026-03-01-phase4-deployment-implementation-critical-review-1.md`.
+
+**Critical fixes (would cause build/runtime failures):**
+- **Task 1:** Added `jar { enabled = false }` in `build.gradle` to prevent multi-JAR build conflicts with `COPY *.jar`
+- **Task 1:** Added `-XX:MaxRAMPercentage=75.0` JVM flag to prevent OOM kills within 512M container limit
+- **Task 3:** Removed invalid CSP source `/uploads/` from `img-src` (`'self'` already covers same-origin paths)
+- **Task 3:** Added `client_max_body_size 10m` to support image uploads > 1MB
+- **Task 4:** Fixed Redis config — replaced `redis.conf` file (which cannot do env var substitution) with command-line `--requirepass` and `REDISCLI_AUTH` for healthcheck
+
+**Robustness fixes:**
+- **Task 1:** Improved Gradle dependency caching layer: `./gradlew bootJar --no-daemon -x test || true`
+- **Task 1:** Expanded `.dockerignore` with `Dockerfile*`, `docker-compose*`, `scripts/`, `nginx/`
+- **Task 2:** Added `HEALTHCHECK` to frontend Dockerfile for consistency
+- **Task 3:** Removed misleading server-level `include security-headers.conf` (Nginx does not inherit `add_header` into child blocks); added warning comment
+- **Task 3:** Added `gzip_vary on` and additional gzip types (`application/xml`, `image/svg+xml`)
+- **Task 3:** Fixed static asset caching: replaced redundant `expires 1y` + `Cache-Control` with single `add_header Cache-Control "public, max-age=31536000, immutable"`
+- **Task 6:** Changed `set -uo pipefail` to `set -euo pipefail` so non-pipeline failures are caught
+- **Task 6:** Single `date` capture to prevent race across midnight
+- **Task 6:** Replaced empty-file check with 1KB minimum size check (empty gzip is ~20 bytes, not zero)
+- **Task 7:** Added `EnvironmentVariables` with `PATH` including `/opt/homebrew/bin` so `docker` is found by launchd
+
+### v1.0 (2026-03-01) — Initial plan
 
 ---
 
