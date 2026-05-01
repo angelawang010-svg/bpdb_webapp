@@ -1,6 +1,6 @@
 # Phase 4: Local Production Deployment (Mac) — Implementation Plan
 
-**Version:** 3.0
+**Version:** 4.0
 **Last Updated:** 2026-04-30
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
@@ -55,6 +55,8 @@ nginx/
 ```
 
 **Step 3: Write multi-stage Dockerfile**
+
+> **Note:** The Dockerfile skips tests (`-x test`) to keep image builds fast. Run `./gradlew test` before building the Docker image to ensure all tests pass.
 
 ```dockerfile
 # Stage 1: Build
@@ -241,12 +243,17 @@ server {
         return 404;
     }
 
-    # Uploaded images
-    location /uploads/ {
-        alias /app/uploads/;
+    # Uploaded images — restricted to image file types only (prevents stored XSS via HTML/SVG uploads)
+    location ~* ^/uploads/.+\.(jpg|jpeg|png|gif|webp)$ {
+        root /app;
         include /etc/nginx/snippets/security-headers.conf;
-        add_header Content-Disposition "inline" always;
-        expires 30d;
+        add_header Content-Security-Policy "default-src 'none'" always;
+        add_header Cache-Control "public, max-age=2592000" always;
+    }
+
+    # Block all non-image upload requests
+    location /uploads/ {
+        return 404;
     }
 
     # React SPA static files
@@ -294,8 +301,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+    # Bound to 127.0.0.1 — HTTP is acceptable for localhost-only access.
+    # For network/VPS deployment, HTTPS is required (see Appendix).
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
@@ -480,6 +489,7 @@ DAY_OF_MONTH=$(echo "$NOW" | cut -d_ -f4)
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 
 mkdir -p "$BACKUP_DIR/daily" "$BACKUP_DIR/weekly" "$BACKUP_DIR/monthly"
+chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/daily" "$BACKUP_DIR/weekly" "$BACKUP_DIR/monthly"
 
 # Create daily backup
 BACKUP_FILE="$BACKUP_DIR/daily/blogplatform_${TIMESTAMP}.sql.gz"
@@ -495,6 +505,8 @@ if [ "$(stat -f%z "$BACKUP_FILE")" -lt 1024 ]; then
     rm -f "$BACKUP_FILE"
     exit 1
 fi
+
+chmod 600 "$BACKUP_FILE"
 
 # Weekly backup (Sunday)
 if [ "$DAY_OF_WEEK" -eq 7 ]; then
@@ -606,9 +618,11 @@ git commit -m "feat: add macOS launchd plist and install script for scheduled ba
 **Step 1: Create .env and build**
 
 ```bash
-cat > .env << 'EOF'
-DB_PASSWORD=localtest12345678901234
-REDIS_PASSWORD=localtest12345678901234
+DB_PASSWORD=$(openssl rand -base64 32)
+REDIS_PASSWORD=$(openssl rand -base64 32)
+cat > .env << EOF
+DB_PASSWORD=$DB_PASSWORD
+REDIS_PASSWORD=$REDIS_PASSWORD
 EOF
 
 docker compose -f docker-compose.prod.yml build
@@ -652,10 +666,14 @@ rm -f cookies.txt
 ./scripts/backup.sh
 ls -la backups/daily/
 
-# Verify backup is restorable
+# Verify backup is restorable (restore to temp database)
 BACKUP_FILE=$(ls -t backups/daily/*.sql.gz | head -1)
+docker compose -f docker-compose.prod.yml exec -T postgres \
+  psql -U blogplatform -d postgres -c "CREATE DATABASE restore_test"
 gunzip -c "$BACKUP_FILE" | docker compose -f docker-compose.prod.yml exec -T postgres \
-  psql -U blogplatform -d blogplatform -c "SELECT 1" > /dev/null
+  psql -U blogplatform -d restore_test > /dev/null
+docker compose -f docker-compose.prod.yml exec -T postgres \
+  psql -U blogplatform -d postgres -c "DROP DATABASE restore_test"
 echo "Backup restore verification passed"
 ```
 
@@ -691,6 +709,21 @@ Phase 4 delivers (8 tasks):
 ---
 
 ## Changelog
+
+### v4.0 (2026-04-30) — Post security audit
+
+Addresses all findings from `2026-04-30-phase4-deployment-implementation-security-audit-1.md`.
+
+**Security fixes (High severity):**
+- **Task 4:** Bound Nginx port to localhost only (`127.0.0.1:80:80`) — prevents network exposure on shared WiFi
+- **Task 3:** Replaced permissive `/uploads/` location with regex image-only location (`jpg|jpeg|png|gif|webp`), returning 404 for all other file types — prevents stored XSS via HTML/SVG uploads
+- **Task 3:** Added restrictive CSP (`default-src 'none'`) to uploads location for defense-in-depth
+
+**Security hardening (Low severity):**
+- **Task 6:** Added `chmod 700` on backup directories and `chmod 600` on backup files to restrict access to database dumps
+- **Task 8:** Replaced hardcoded smoke test passwords with `openssl rand -base64 32` generated passwords
+- **Task 1:** Added note to run `./gradlew test` before Docker image builds (Dockerfile skips tests for speed)
+- **Task 8:** Fixed backup restore verification — replaced no-op `psql -c "SELECT 1"` (which ignores piped stdin) with actual restore to temporary database
 
 ### v3.0 (2026-04-30) — Post second critical implementation review
 
