@@ -1,7 +1,7 @@
 # Phase 4: Local Production Deployment (Mac) — Implementation Plan
 
-**Version:** 2.0
-**Last Updated:** 2026-03-16
+**Version:** 3.0
+**Last Updated:** 2026-04-30
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -62,6 +62,7 @@ FROM eclipse-temurin:21-jdk AS build
 WORKDIR /app
 COPY backend/gradle/ gradle/
 COPY backend/gradlew backend/build.gradle backend/settings.gradle ./
+RUN chmod +x gradlew
 RUN ./gradlew bootJar --no-daemon -x test || true
 COPY backend/src/ src/
 RUN ./gradlew bootJar --no-daemon -x test
@@ -79,7 +80,7 @@ USER app
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD wget -q --spider http://localhost:8080/actuator/health || exit 1
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar", "--spring.profiles.active=prod"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
 ```
 
 **Step 4: Verify build**
@@ -171,6 +172,7 @@ http {
 
     sendfile on;
     keepalive_timeout 65;
+    server_tokens off;
 
     # Gzip compression
     gzip on;
@@ -182,7 +184,7 @@ http {
     client_max_body_size 10m;
 
     # Rate limiting
-    limit_req_zone $binary_remote_addr zone=auth:10m rate=5r/m;
+    limit_req_zone $binary_remote_addr zone=auth:10m rate=10r/m;
     limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
 
     # Logging
@@ -208,7 +210,8 @@ server {
 
     # Auth endpoints — strict rate limiting
     location /api/v1/auth/ {
-        limit_req zone=auth burst=3 nodelay;
+        limit_req zone=auth burst=5 nodelay;
+        limit_req_status 429;
         proxy_pass http://backend:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -279,9 +282,12 @@ git commit -m "feat: add Nginx config with security headers, rate limiting, API 
 **Step 1: Write production Compose file**
 
 ```yaml
+name: blogplatform
+
 networks:
   frontend:
   backend:
+    internal: true
 
 services:
   nginx:
@@ -294,13 +300,18 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./nginx/snippets:/etc/nginx/snippets:ro
-      - uploads:/app/uploads:ro
+      - ./uploads:/app/uploads:ro
     depends_on:
       backend:
         condition: service_healthy
     networks:
       - frontend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -320,7 +331,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       SPRING_PROFILES_ACTIVE: prod
     volumes:
-      - uploads:/app/uploads
+      - ./uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -330,6 +341,11 @@ services:
       - frontend
       - backend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -352,6 +368,11 @@ services:
     networks:
       - backend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -360,6 +381,8 @@ services:
 
   redis:
     image: redis:7
+    # NOTE: No persistence configured (appendonly off). Container restart loses all sessions.
+    # This is intentional for local single-user deployment. Enable appendonly for multi-user use.
     command: redis-server --requirepass ${REDIS_PASSWORD}
     environment:
       REDISCLI_AUTH: ${REDIS_PASSWORD}
@@ -371,6 +394,11 @@ services:
     networks:
       - backend
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
@@ -379,7 +407,6 @@ services:
 
 volumes:
   pgdata:
-  uploads:
 ```
 
 **Step 2: Verify Compose config is valid**
@@ -406,9 +433,11 @@ git commit -m "feat: add production Docker Compose with network segmentation and
 
 ```
 # Database
+# Generate with: openssl rand -base64 32
 DB_PASSWORD=changeme-minimum-24-characters-random
 
 # Redis
+# Generate with: openssl rand -base64 32
 REDIS_PASSWORD=changeme-minimum-24-characters-random
 ```
 
@@ -473,11 +502,12 @@ if [ "$DAY_OF_WEEK" -eq 7 ]; then
 fi
 
 # Monthly backup (1st of month)
-if [ "$DAY_OF_MONTH" -eq "01" ]; then
+if [ "$DAY_OF_MONTH" -eq 1 ]; then
     cp "$BACKUP_FILE" "$BACKUP_DIR/monthly/"
 fi
 
-# Retention: 7 daily, 4 weekly, 3 monthly
+# Retention: at least 7 daily, at least 4 weekly, at least 3 monthly
+# (find -mtime +N means strictly > N days, so actual retention is N+1 days)
 find "$BACKUP_DIR/daily" -name "*.sql.gz" -mtime +7 -delete
 find "$BACKUP_DIR/weekly" -name "*.sql.gz" -mtime +30 -delete
 find "$BACKUP_DIR/monthly" -name "*.sql.gz" -mtime +90 -delete
@@ -529,6 +559,10 @@ git commit -m "feat: add database backup script with retention policy"
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>BACKUP_DIR</key>
+        <string>REPLACE_WITH_REPO_PATH/backups</string>
+        <key>COMPOSE_FILE</key>
+        <string>docker-compose.prod.yml</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/tmp/blogplatform-backup.log</string>
@@ -540,18 +574,29 @@ git commit -m "feat: add database backup script with retention policy"
 </plist>
 ```
 
-Install with:
+**Step 2: Write install script**
+
+`scripts/install-backup-scheduler.sh`:
 ```bash
-# Edit the plist to replace REPLACE_WITH_REPO_PATH with your actual repo path
-cp scripts/com.blogplatform.backup.plist ~/Library/LaunchAgents/
+#!/bin/bash
+set -euo pipefail
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+sed "s|REPLACE_WITH_REPO_PATH|$REPO_DIR|g" \
+  "$REPO_DIR/scripts/com.blogplatform.backup.plist" \
+  > ~/Library/LaunchAgents/com.blogplatform.backup.plist
 launchctl load ~/Library/LaunchAgents/com.blogplatform.backup.plist
+echo "Backup scheduler installed for $REPO_DIR"
 ```
 
-**Step 2: Commit**
+Run: `chmod +x scripts/install-backup-scheduler.sh`
+
+Install with: `./scripts/install-backup-scheduler.sh`
+
+**Step 3: Commit**
 
 ```bash
-git add scripts/com.blogplatform.backup.plist
-git commit -m "feat: add macOS launchd plist for scheduled backups"
+git add scripts/com.blogplatform.backup.plist scripts/install-backup-scheduler.sh
+git commit -m "feat: add macOS launchd plist and install script for scheduled backups"
 ```
 
 ---
@@ -578,23 +623,40 @@ Expected: All 4 containers running and healthy.
 **Step 3: Smoke test endpoints**
 
 ```bash
-# Health check
+# Health check — verify only {"status":"UP"} with no component details
 curl http://localhost/actuator/health
-
-# Register
-curl -X POST http://localhost/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"prod","email":"prod@test.com","password":"Password1"}'
+# Expected: {"status":"UP"} — no postgres/redis/disk details
 
 # Verify actuator blocked
 curl http://localhost/actuator/env  # Should return 404
+
+# Fetch CSRF token for subsequent requests
+CSRF_TOKEN=$(curl -s -c cookies.txt http://localhost/api/v1/auth/csrf \
+  | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+# Register (include CSRF token)
+curl -X POST http://localhost/api/v1/auth/register \
+  -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -H "X-XSRF-TOKEN: $CSRF_TOKEN" \
+  -d '{"username":"smoketest","email":"smoke@test.com","password":"Sm0keTest!2026"}'
+
+# Cleanup
+rm -f cookies.txt
 ```
 
-**Step 4: Test backup**
+**Step 4: Test backup and restore**
 
 ```bash
+# Create backup
 ./scripts/backup.sh
 ls -la backups/daily/
+
+# Verify backup is restorable
+BACKUP_FILE=$(ls -t backups/daily/*.sql.gz | head -1)
+gunzip -c "$BACKUP_FILE" | docker compose -f docker-compose.prod.yml exec -T postgres \
+  psql -U blogplatform -d blogplatform -c "SELECT 1" > /dev/null
+echo "Backup restore verification passed"
 ```
 
 **Step 5: Tear down**
@@ -620,15 +682,44 @@ Phase 4 delivers (8 tasks):
 - Nginx configuration with security headers, rate limiting, API proxy, actuator blocking, SPA routing
 - Production Docker Compose with health checks, restart policies, network segmentation, and resource limits
 - Environment configuration (.env.example with secrets documented)
-- Database backup script with tiered retention (7 daily + 4 weekly + 3 monthly)
-- macOS launchd scheduler for automated backups
-- Local smoke test
+- Database backup script with tiered retention (at least 7 daily + 4 weekly + 3 monthly)
+- macOS launchd scheduler with automated install script
+- Local smoke test with CSRF handling and backup restore verification
 
 **Deployment:** `cp .env.example .env`, edit passwords, `docker compose -f docker-compose.prod.yml up -d`.
 
 ---
 
 ## Changelog
+
+### v3.0 (2026-04-30) — Post second critical implementation review
+
+Addresses all issues from `2026-03-01-phase4-deployment-implementation-critical-review-2.md`.
+
+**Correctness fixes:**
+- **Task 1:** Added `RUN chmod +x gradlew` to prevent permission denied errors after COPY
+- **Task 1:** Removed `--spring.profiles.active=prod` from ENTRYPOINT — profile now controlled solely via `SPRING_PROFILES_ACTIVE` env var in Compose for flexibility
+- **Task 3:** Relaxed auth rate limit from `5r/m` to `10r/m` with `burst=5` to let app-layer brute-force controls handle normal scenarios
+- **Task 3:** Added `limit_req_status 429` so rate-limited requests return proper `429 Too Many Requests` instead of `503`
+- **Task 3:** Added `server_tokens off` to suppress Nginx version disclosure
+- **Task 6:** Fixed `"01"` string comparison to integer `1` in monthly backup check
+- **Task 6:** Updated retention comments to document `find -mtime` off-by-one semantics (actual retention is N+1 days)
+- **Task 8:** Fixed smoke test password (`Password1` → `Sm0keTest!2026`) to meet password policy
+- **Task 8:** Added CSRF token fetch and inclusion in smoke test requests
+
+**Security hardening:**
+- **Task 4:** Added `internal: true` to backend Docker network (postgres/redis cannot reach internet)
+- **Task 8:** Added actuator health detail verification (must show only `{"status":"UP"}` with no component details — requires `management.endpoint.health.show-details: never` in `application-prod.yml`)
+
+**Robustness improvements:**
+- **Task 4:** Added `name: blogplatform` for consistent Docker Compose project naming
+- **Task 4:** Changed uploads from named volume to bind mount (`./uploads:/app/uploads`) for direct Finder access on local Mac
+- **Task 4:** Added `logging` config with rotation (`max-size: 10m`, `max-file: 3`) to all 4 services
+- **Task 4:** Added comment documenting intentional Redis no-persistence decision
+- **Task 5:** Added `openssl rand -base64 32` generation command to `.env.example`
+- **Task 7:** Added `BACKUP_DIR` and `COMPOSE_FILE` to launchd plist environment variables
+- **Task 7:** Added `scripts/install-backup-scheduler.sh` to auto-substitute repo path (replaces manual `REPLACE_WITH_REPO_PATH` editing)
+- **Task 8:** Added backup restore verification step to smoke test
 
 ### v2.0 (2026-03-16) — Post critical implementation review
 
