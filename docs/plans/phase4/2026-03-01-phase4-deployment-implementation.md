@@ -1,6 +1,6 @@
 # Phase 4: Local Production Deployment (Mac) — Implementation Plan
 
-**Version:** 4.0
+**Version:** 5.0
 **Last Updated:** 2026-04-30
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
@@ -73,6 +73,7 @@ RUN ./gradlew bootJar --no-daemon -x test
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 RUN addgroup --system app && adduser --system --ingroup app app
 
 COPY --from=build /app/build/libs/*.jar app.jar
@@ -81,7 +82,7 @@ RUN mkdir -p /app/uploads && chown app:app /app/uploads
 USER app
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -q --spider http://localhost:8080/actuator/health || exit 1
+  CMD curl -sf http://localhost:8080/actuator/health || exit 1
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
 ```
 
@@ -437,6 +438,7 @@ git commit -m "feat: add production Docker Compose with network segmentation and
 **Files:**
 - Modify: `.env.example` — add all production secrets
 - Modify: `.gitignore` — ensure `.env` and sensitive files excluded
+- Modify: `backend/src/main/resources/application-prod.yml` — add production-specific settings
 
 **Step 1: Update .env.example**
 
@@ -450,7 +452,21 @@ DB_PASSWORD=changeme-minimum-24-characters-random
 REDIS_PASSWORD=changeme-minimum-24-characters-random
 ```
 
-**Step 2: Update .gitignore**
+**Step 2: Update application-prod.yml**
+
+Add the following to `backend/src/main/resources/application-prod.yml`:
+```yaml
+server:
+  forward-headers-strategy: framework  # Trust Nginx X-Forwarded-* headers
+
+management:
+  endpoint:
+    health:
+      show-details: never  # Do not expose component details in production
+```
+`forward-headers-strategy: framework` is required when running behind Nginx — without it, Spring Boot ignores `X-Forwarded-Proto`, `X-Forwarded-For`, etc.
+
+**Step 3: Update .gitignore**
 
 Ensure these are in `.gitignore`:
 ```
@@ -460,10 +476,10 @@ Ensure these are in `.gitignore`:
 /uploads/
 ```
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add .env.example .gitignore
+git add .env.example .gitignore backend/src/main/resources/application-prod.yml
 git commit -m "feat: update env example and gitignore for production"
 ```
 
@@ -709,6 +725,10 @@ Phase 4 delivers (8 tasks):
 ---
 
 ## Changelog
+
+### v5.0 (2026-04-30) — Per cross-phase consistency review
+
+- Cross-phase consistency review. Changes: (1) Fixed backend Dockerfile healthcheck — replaced wget with curl (eclipse-temurin:21-jre does not include wget); added apt-get install curl step. (2) Added application-prod.yml updates to Task 5 — server.forward-headers-strategy: framework (required behind Nginx) and management.endpoint.health.show-details: never.
 
 ### v4.0 (2026-04-30) — Post security audit
 

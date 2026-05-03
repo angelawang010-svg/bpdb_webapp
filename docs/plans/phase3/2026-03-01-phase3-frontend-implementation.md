@@ -1,7 +1,7 @@
 # Phase 3: Front-End (React SPA) — Implementation Plan
 
-**Version:** 3.1
-**Last Updated:** 2026-03-16
+**Version:** 4.0
+**Last Updated:** 2026-04-30
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -70,6 +70,8 @@ git commit -m "feat: add /auth/csrf GET endpoint for SPA CSRF token priming"
 cd /path/to/blog-platform
 npm create vite@latest frontend -- --template react-ts
 cd frontend
+# Pin React 18 — Vite may scaffold React 19 by default, which has breaking changes
+npm install react@18 react-dom@18 @types/react@18 @types/react-dom@18
 npm install
 ```
 
@@ -214,7 +216,8 @@ export interface PostSummary {
 export interface PostDetail {
   postId: number;
   title: string;
-  content: string;
+  contentRaw: string;   // Original Markdown (for editing)
+  contentHtml: string;  // Server-sanitized HTML (for display)
   authorId: number;
   authorName: string;
   categoryName: string;
@@ -233,7 +236,8 @@ export interface PostDetail {
 ```typescript
 export interface Comment {
   commentId: number;
-  content: string;
+  contentRaw: string;   // Rendered as plain text (not Markdown)
+  contentHtml: string;  // Server-sanitized (available but not used — comments render as plain text)
   username: string;
   createdAt: string;
   replies: Comment[];
@@ -817,16 +821,23 @@ test('CommentForm shows character count', () => {
 
 **Step 2: Implement**
 
-`PostPage`: On mount, calls `postsApi.markAsRead(postId)` via a `useEffect` to trigger read-tracking. This ensures `hasRead` becomes `true` so the `CommentForm` is enabled.
+`PostPage`: Read-tracking is handled automatically by the backend — the `GET /api/v1/posts/{id}` endpoint calls `markAsRead()` as a side effect for authenticated users. No separate frontend API call is needed. After the initial GET resolves, `hasRead` will be `true` in the response, enabling the `CommentForm`.
 
-`PostDetail`: renders Markdown via `react-markdown` + `rehype-sanitize`. Shows like button (toggle), save/bookmark button, share. **NEVER uses `dangerouslySetInnerHTML`.**
+`PostDetail`: renders post content using `contentHtml` (server-sanitized HTML from Phase 2A) via `dangerouslySetInnerHTML`. This is safe because the backend already sanitizes HTML through OWASP Java HTML Sanitizer. `react-markdown` is only used in the post editor's live preview (on `contentRaw`). **NEVER use `dangerouslySetInnerHTML` on unsanitized or user-supplied content.** Shows like button (toggle), save/bookmark button, share.
 
 `useLike` and `useSave` hooks: implement **optimistic updates** using React Query's `useMutation` with `onMutate` for instant UI feedback:
 ```typescript
 export function useLike(postId: number) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () => likesApi.toggleLike(postId),
+    mutationFn: async () => {
+      const current = queryClient.getQueryData<PostDetail>(['post', postId]);
+      if (current?.hasLiked) {
+        await likesApi.unlike(postId);    // DELETE /api/v1/posts/{id}/likes
+      } else {
+        await likesApi.like(postId);      // POST /api/v1/posts/{id}/likes
+      }
+    },
     onMutate: async () => {
       await queryClient.cancelQueries({ queryKey: ['post', postId] });
       const previous = queryClient.getQueryData<PostDetail>(['post', postId]);
@@ -843,7 +854,7 @@ export function useLike(postId: number) {
 }
 ```
 
-Same pattern for `useSave` (toggling `hasSaved`).
+Same pattern for `useSave` (toggling `hasSaved`), using `savesApi.save(postId)` (POST) and `savesApi.unsave(postId)` (DELETE) based on current `hasSaved` state.
 
 **Cache invalidation convention:** Every `useMutation` across all tasks must include `onSuccess` (or `onSettled`) with `queryClient.invalidateQueries()` for affected query keys. Key mappings: post creation/deletion → `['posts']`, comment creation/deletion → `['comments', postId]`, profile update → `['user']`, admin actions → relevant entity key. Likes/saves use the optimistic pattern above with `onSettled` invalidation.
 
@@ -1180,6 +1191,10 @@ Phase 3 delivers (19 tasks — Task 0 through Task 18):
 ---
 
 ## Changelog
+
+### v4.0 — 2026-04-30
+
+Cross-phase consistency review. Changes: (1) Updated PostDetail type — content field split into contentRaw + contentHtml to match Phase 2A server-side sanitization contract. (2) Updated Comment type — content split into contentRaw + contentHtml. (3) Updated PostDetail rendering — uses contentHtml via dangerouslySetInnerHTML (safe: server-sanitized); react-markdown retained only for editor live preview. (4) Fixed like/save hooks — replaced single toggleLike/toggleSave with separate like/unlike and save/unsave calls matching Phase 2A POST/DELETE endpoints. (5) Removed redundant markAsRead() call — backend GET endpoint already handles read-tracking as side effect. (6) Added React 18 version pinning after Vite scaffold to prevent React 19 breaking changes.
 
 ### v3.1 — 2026-03-16
 

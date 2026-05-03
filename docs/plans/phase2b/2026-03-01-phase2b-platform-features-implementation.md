@@ -1,6 +1,6 @@
 # Phase 2B: Platform Features — Implementation Plan
 
-**Version:** 5.0
+**Version:** 6.0
 
 (Part 2 of 2 — Tasks 11-22 of 21)
 
@@ -15,6 +15,23 @@
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — Sections 5 (API Endpoints), 6 (Business Logic Migration), and 8 (Testing Strategy).
 
 **Prerequisite:** Phase 2A (Tasks 1-9) must be complete, including Task 5 (save/unsave post endpoints).
+
+**New dependencies to add to `build.gradle` before starting Phase 2B:**
+```groovy
+implementation 'org.springframework.retry:spring-retry'
+implementation 'org.springframework.boot:spring-boot-starter-aop'
+testImplementation 'org.awaitility:awaitility'
+```
+Add `@EnableAsync` and `@EnableRetry` to a configuration class (e.g., `AsyncConfig.java`).
+
+**Required Flyway migration (V5) — add before Task 15:**
+Create `backend/src/main/resources/db/migration/V5__add_token_created_at.sql`:
+```sql
+ALTER TABLE password_reset_token ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE email_verification_token ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE image ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0;
+```
+These columns are required for token rate-limiting (Task 15/16) and image upload quota tracking (Task 17).
 
 ## Phase 2 Parts
 
@@ -670,13 +687,13 @@ public class ScheduledJobs {
 ```
 
 Add batched native delete queries to repositories (PostgreSQL-compatible syntax):
-- `NotificationRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM notification WHERE id IN (SELECT id FROM notification WHERE is_read = true AND created_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
-- `ReadPostRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM read_post WHERE id IN (SELECT id FROM read_post WHERE read_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
-- `PasswordResetTokenRepository`: `@Modifying @Query("DELETE FROM PasswordResetToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
-- `EmailVerificationTokenRepository`: `@Modifying @Query("DELETE FROM EmailVerificationToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")`
-- `PostUpdateLogRepository`: `@Modifying @Query("UPDATE PostUpdateLog l SET l.ipAddress = NULL, l.userAgent = NULL WHERE l.ipAddress IS NOT NULL AND l.createdAt < :cutoff")` — nullifies forensic fields (ip_address, user_agent) per 90-day retention policy defined in Phase 2A Task 4
+- `NotificationRepository`: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM notification WHERE notification_id IN (SELECT notification_id FROM notification WHERE is_read = true AND created_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
+- `ReadPostRepository` — `read_post` has a composite PK `(account_id, post_id)` with no surrogate `id`, so use `ctid` for batched deletes: `@Transactional(propagation = Propagation.REQUIRES_NEW) @Modifying @Query(value = "DELETE FROM read_post WHERE ctid IN (SELECT ctid FROM read_post WHERE read_at < :cutoff LIMIT :batchSize)", nativeQuery = true)`
+- `PasswordResetTokenRepository`: `@Modifying @Query("DELETE FROM PasswordResetToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")` — requires V5 migration adding `created_at` column (see Prerequisites)
+- `EmailVerificationTokenRepository`: `@Modifying @Query("DELETE FROM EmailVerificationToken t WHERE (t.used = true OR t.expiresAt < :now) AND t.createdAt < :cutoff")` — requires V5 migration adding `created_at` column (see Prerequisites)
+- `PostUpdateLogRepository`: `@Modifying @Query("UPDATE PostUpdateLog l SET l.ipAddress = NULL, l.userAgent = NULL WHERE l.ipAddress IS NOT NULL AND l.updatedAt < :cutoff")` — nullifies forensic fields (ip_address, user_agent) per 90-day retention policy defined in Phase 2A Task 4. **Note:** `PostUpdateLog` entity uses `updatedAt` (not `createdAt`); the `ipAddress` and `userAgent` fields must be added to the entity alongside the Phase 2A V3 migration.
 
-Note: Uses `DELETE ... WHERE id IN (SELECT id ... LIMIT)` subquery for PostgreSQL compatibility (PostgreSQL does not support `LIMIT` directly on `DELETE`).
+Note: Uses `DELETE ... WHERE PK IN (SELECT PK ... LIMIT)` subquery for PostgreSQL compatibility (PostgreSQL does not support `LIMIT` directly on `DELETE`). For `read_post`, uses `ctid` since the table has a composite PK with no surrogate ID.
 
 <!-- Note: For multi-instance deployments, add ShedLock or equivalent distributed lock to prevent redundant concurrent execution of scheduled jobs. -->
 
@@ -816,6 +833,10 @@ Phase 2 delivers (22 tasks across 2A + 2B):
 ---
 
 ## Changelog
+
+### v6.0 (2026-04-30) — Per cross-phase consistency review
+
+- Cross-phase consistency review. Changes: (1) Added prerequisite block: spring-retry, spring-boot-starter-aop, awaitility dependencies; @EnableAsync and @EnableRetry configuration. (2) Added V5 Flyway migration for created_at on token tables and file_size on image table. (3) Fixed notification cleanup query — notification_id not id. (4) Fixed read_post cleanup query — uses ctid for composite-PK table with no surrogate id. (5) Fixed PostUpdateLog forensic field nullification query — uses updatedAt (not createdAt); added note about ipAddress/userAgent dependency on Phase 2A V3 migration.
 
 ### v5.0 (2026-03-15) — Per cross-plan consistency review
 

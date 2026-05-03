@@ -10,6 +10,13 @@
 
 **Tech Stack:** Same as Phase 1. Additionally: Apache Tika (image validation), `@Async` + `@TransactionalEventListener` (notifications), `@Scheduled` (cleanup jobs).
 
+**New dependencies to add to `build.gradle` before starting Phase 2A:**
+```groovy
+implementation 'org.commonmark:commonmark:0.22.0'
+implementation 'com.googlecode.owasp-java-html-sanitizer:java-html-sanitizer:20240325.1'
+```
+These are required for server-side Markdown rendering and HTML sanitization (Task 4, `MarkdownSanitizer`).
+
 **Reference:** Design document at `docs/plans/2026-02-27-java-migration-design.md` (v7.0) — Sections 5 (API Endpoints), 6 (Business Logic Migration), and 8 (Testing Strategy).
 
 **Prerequisite:** Phase 1 must be complete (all 15 tasks).
@@ -23,7 +30,7 @@
 
 These conventions apply to every task in this plan:
 
-- **Logging:** All service classes use `@Slf4j` (Lombok). Log mutations at `info` level with entity IDs (`log.info("Created category id={}", cat.getCategoryId())`). Log business rule rejections at `warn` level (`log.warn("User {} attempted to comment on unread post {}", userId, postId)`).
+- **Logging:** All service classes declare a manual logger: `private static final Logger log = LoggerFactory.getLogger(ClassName.class);` (the project does not use Lombok). Log mutations at `info` level with entity IDs (`log.info("Created category id={}", cat.getId())`). Log business rule rejections at `warn` level (`log.warn("User {} attempted to comment on unread post {}", userId, postId)`).
 - **Read-only transactions:** All read-only service methods use `@Transactional(readOnly = true)` for dirty-checking optimization and read-replica routing readiness.
 - **Integration test base class:** All `*IT` classes extend `BaseIntegrationTest` (from Phase 1) instead of defining their own Testcontainers setup. Do NOT duplicate `@Container`/`@DynamicPropertySource` boilerplate.
 - **Test isolation:** All `*IT` classes are annotated with `@Transactional` for automatic rollback between tests, preventing inter-test data leakage.
@@ -140,7 +147,7 @@ import com.blogplatform.category.Category;
 public record CategoryResponse(Long categoryId, String categoryName, String description) {
 
     public static CategoryResponse from(Category c) {
-        return new CategoryResponse(c.getCategoryId(), c.getCategoryName(), c.getDescription());
+        return new CategoryResponse(c.getId(), c.getCategoryName(), c.getDescription());
     }
 }
 ```
@@ -153,7 +160,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface CategoryRepository extends JpaRepository<Category, Long> {
     boolean existsByCategoryName(String categoryName);
-    boolean existsByCategoryNameAndCategoryIdNot(String categoryName, Long categoryId);
+    boolean existsByCategoryNameAndIdNot(String categoryName, Long id);
 }
 ```
 
@@ -164,16 +171,18 @@ package com.blogplatform.category;
 import com.blogplatform.category.dto.CreateCategoryRequest;
 import com.blogplatform.common.exception.BadRequestException;
 import com.blogplatform.common.exception.ResourceNotFoundException;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
-@Slf4j
 @Service
 public class CategoryService {
+
+    private static final Logger log = LoggerFactory.getLogger(CategoryService.class);
 
     private final CategoryRepository categoryRepository;
 
@@ -196,7 +205,7 @@ public class CategoryService {
         category.setDescription(request.description());
         try {
             Category saved = categoryRepository.save(category);
-            log.info("Created category id={} name='{}'", saved.getCategoryId(), saved.getCategoryName());
+            log.info("Created category id={} name='{}'", saved.getId(), saved.getCategoryName());
             return saved;
         } catch (DataIntegrityViolationException e) {
             throw new BadRequestException("Category name already exists");
@@ -207,14 +216,14 @@ public class CategoryService {
     public Category update(Long id, CreateCategoryRequest request) {
         Category category = categoryRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Category not found"));
-        if (categoryRepository.existsByCategoryNameAndCategoryIdNot(request.categoryName(), id)) {
+        if (categoryRepository.existsByCategoryNameAndIdNot(request.categoryName(), id)) {
             throw new BadRequestException("Category name already exists");
         }
         category.setCategoryName(request.categoryName());
         category.setDescription(request.description());
         try {
             Category saved = categoryRepository.save(category);
-            log.info("Updated category id={} name='{}'", saved.getCategoryId(), saved.getCategoryName());
+            log.info("Updated category id={} name='{}'", saved.getId(), saved.getCategoryName());
             return saved;
         } catch (DataIntegrityViolationException e) {
             throw new BadRequestException("Category name already exists");
@@ -503,7 +512,25 @@ public record UpdatePostRequest(
 ) {}
 ```
 
-`PostListResponse`:
+`PostListProjection` — intermediate record for JPQL constructor expression (no tags):
+```java
+package com.blogplatform.post.dto;
+
+import java.time.Instant;
+
+public record PostListProjection(
+        Long postId,
+        String title,
+        String authorName,
+        String categoryName,
+        long likeCount,
+        long commentCount,
+        boolean isPremium,
+        Instant createdAt
+) {}
+```
+
+`PostListResponse` — final DTO with tags, assembled in the service layer:
 ```java
 package com.blogplatform.post.dto;
 
@@ -520,7 +547,12 @@ public record PostListResponse(
         long commentCount,
         boolean isPremium,
         Instant createdAt
-) {}
+) {
+    public static PostListResponse from(PostListProjection p, Set<String> tags) {
+        return new PostListResponse(p.postId(), p.title(), p.authorName(), p.categoryName(),
+                tags, p.likeCount(), p.commentCount(), p.isPremium(), p.createdAt());
+    }
+}
 ```
 
 `PostDetailResponse`: Full post with content, author info, tags, like count, whether current user has liked/read/saved.
@@ -530,15 +562,17 @@ public record PostListResponse(
 `PostRepository` with custom queries:
 - `findAllWithCounts(Pageable)` — JPQL with correlated COUNT subqueries (NOT `JOIN + GROUP BY` — that causes the fan-out problem with inflated counts when joining both likes and comments):
 ```java
-@Query("SELECT new com.blogplatform.post.dto.PostListResponse(" +
+@Query("SELECT new com.blogplatform.post.dto.PostListProjection(" +
        "p.id, p.title, p.author.username, p.category.categoryName, " +
        "(SELECT COUNT(l) FROM Like l WHERE l.post = p), " +
-       "(SELECT COUNT(c) FROM Comment c WHERE c.post = p AND c.deleted = false), " +
+       "(SELECT COUNT(c) FROM Comment c WHERE c.post = p), " +
        "p.premium, p.createdAt) " +
        "FROM BlogPost p WHERE p.deleted = false")
-Page<PostListResponse> findAllWithCounts(Pageable pageable);
+Page<PostListProjection> findAllWithCounts(Pageable pageable);
 ```
   > **Note on tags:** Tags cannot be projected in a JPQL constructor expression as a `Set<String>`. Fetch post IDs from the page result, then batch-load tags via `findTagsByPostIdIn(Set<Long> postIds)` and merge in the service layer.
+
+  > **Note on comment count:** This query counts all comments. In Task 7, when `is_deleted` is added to the `comment` table, update this query to filter: `(SELECT COUNT(c) FROM Comment c WHERE c.post = p AND c.deleted = false)`.
 
 - `findByAuthorId(Long, Pageable)`
 - `countByCategoryId(Long)`
@@ -554,7 +588,11 @@ Page<BlogPost> searchByText(@Param("query") String query, Pageable pageable);
 ```
 
 `ReadPostRepository`:
-- `existsByAccountIdAndPostId(Long, Long)`
+- `existsByAccountAndPost` — uses `@Query` since `ReadPost` has composite `@IdClass`:
+```java
+@Query("SELECT CASE WHEN COUNT(r) > 0 THEN true ELSE false END FROM ReadPost r WHERE r.account.accountId = :accountId AND r.post.id = :postId")
+boolean existsByAccountAndPost(@Param("accountId") Long accountId, @Param("postId") Long postId);
+```
 - `markAsRead(Long accountId, Long postId)` — native upsert query:
 ```java
 @Modifying
@@ -564,7 +602,11 @@ Page<BlogPost> searchByText(@Param("query") String query, Pageable pageable);
 void markAsRead(@Param("accountId") Long accountId, @Param("postId") Long postId);
 ```
 
-`SavedPostRepository`: `findByAccountId(Long, Pageable)`
+`SavedPostRepository` — uses `@Query` since `SavedPost` has composite `@IdClass`:
+```java
+@Query("SELECT s FROM SavedPost s WHERE s.account.accountId = :accountId")
+Page<SavedPost> findByAccountId(@Param("accountId") Long accountId, Pageable pageable);
+```
 
 **Step 3: Verify it compiles**
 
@@ -585,6 +627,11 @@ git commit -m "feat: add Post DTOs and repositories with custom queries"
 - Create: `backend/src/main/java/com/blogplatform/post/PostService.java`
 - Create: `backend/src/test/java/com/blogplatform/post/PostServiceTest.java`
 - Create: `backend/src/main/resources/db/migration/V3__add_audit_updated_by.sql` — adds `updated_by BIGINT REFERENCES user_account(account_id)`, `ip_address VARCHAR(45)`, and `user_agent VARCHAR(500)` to `post_update_log` table (IP/user-agent for forensic audit trail; subject to 90-day retention policy — cleanup job in Phase 2B)
+- Modify: `backend/src/main/java/com/blogplatform/post/PostUpdateLog.java` — add fields to match V3 migration:
+  - `@ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "updated_by") private UserAccount updatedBy;`
+  - `@Column(name = "ip_address", length = 45) private String ipAddress;`
+  - `@Column(name = "user_agent", length = 500) private String userAgent;`
+  - Add corresponding getters and setters.
 - Create: `backend/src/main/java/com/blogplatform/common/security/MarkdownSanitizer.java`
 
 **Step 1: Write failing unit tests**
@@ -701,7 +748,7 @@ These tests validate the stored procedure migration (see design doc Section 6, S
 @Test
 void addComment_userHasNotReadPost_throwsForbidden() {
     // ReadPost does not exist for (userId, postId)
-    when(readPostRepository.existsByAccountIdAndPostId(1L, 1L)).thenReturn(false);
+    when(readPostRepository.existsByAccountAndPost(1L, 1L)).thenReturn(false);
     assertThatThrownBy(() -> commentService.addComment(1L, 1L, request))
             .isInstanceOf(ForbiddenException.class)
             .hasMessageContaining("must read");
@@ -851,10 +898,17 @@ git commit -m "feat: add CommentController with threaded comments, pagination, o
 
 **Step 2: Implement LikeRepository, LikeService, LikeController**
 
-`LikeRepository`:
-- `countByPostId(Long)`
-- `existsByAccountIdAndPostId(Long, Long)`
-- `findByAccountIdAndPostId(Long, Long)` → Optional
+`LikeRepository` — `Like` has a surrogate PK but `account`/`post` are entity relationships, so use `@Query` or property path navigation:
+```java
+@Query("SELECT COUNT(l) FROM Like l WHERE l.post.id = :postId")
+long countByPostId(@Param("postId") Long postId);
+
+@Query("SELECT CASE WHEN COUNT(l) > 0 THEN true ELSE false END FROM Like l WHERE l.account.accountId = :accountId AND l.post.id = :postId")
+boolean existsByAccountAndPost(@Param("accountId") Long accountId, @Param("postId") Long postId);
+
+@Query("SELECT l FROM Like l WHERE l.account.accountId = :accountId AND l.post.id = :postId")
+Optional<Like> findByAccountAndPost(@Param("accountId") Long accountId, @Param("postId") Long postId);
+```
 - Idempotent like via native upsert (matching the ReadPost pattern):
 ```java
 @Modifying
@@ -920,7 +974,8 @@ git commit -m "feat: add Author profile listing with post counts"
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-03-01 | Initial plan with Tasks 1-10 |
-| 2.0 | 2026-03-15 | Revised per critical review (`2026-03-01-phase2a-content-crud-implementation-critical-review-1.md`). Changes: (1) Removed Task 5 (PostEntityListener) — creation audit logging moved into Task 4 PostService to avoid static injection anti-pattern and keep audit in one place. Tasks renumbered 1-9. (2) Added `ReadPostRepository.markAsRead()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`) in Task 3 to prevent duplicate insert errors on re-view. (3) Added `DataIntegrityViolationException` catch on all uniqueness-checked operations (Tasks 1, 2) as TOCTOU race guard. (4) Added `existsByCategoryNameAndCategoryIdNot` duplicate name check on Category update (Task 1). (5) Specified single-query + in-memory tree assembly for comment threading (Task 7) to prevent N+1 queries. (6) Added top-level comment pagination to `GET /api/v1/posts/{id}/comments` (Task 7). (7) Replaced ambiguous re-parenting prose with explicit depth algorithm and concrete A→B→C→D example (Task 6). (8) Added explicit `ownershipVerifier.verify()` calls for post update/delete (Task 5) and comment delete (Task 7) with IDOR prevention tests. (9) Added premium access exemptions for post author and ADMIN role (Task 4). (10) Added Cross-Cutting Conventions section: `@Slf4j` logging, `@Transactional(readOnly=true)`, extend `BaseIntegrationTest`, `@Transactional` on IT classes, `DataIntegrityViolationException` catch pattern. (11) Added explicit Tag unit tests (Task 2). (12) Documented PUT = full-replacement semantics for Category and Post updates. Phase 2B task numbers shifted (now Tasks 10-22). |
+| 2.0 | 2026-03-15 | Revised per critical review (`2026-03-01-phase2a-content-crud-implementation-critical-review-1.md`). Changes: (1) Removed Task 5 (PostEntityListener) — creation audit logging moved into Task 4 PostService to avoid static injection anti-pattern and keep audit in one place. Tasks renumbered 1-9. (2) Added `ReadPostRepository.markAsRead()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`) in Task 3 to prevent duplicate insert errors on re-view. (3) Added `DataIntegrityViolationException` catch on all uniqueness-checked operations (Tasks 1, 2) as TOCTOU race guard. (4) Added `existsByCategoryNameAndCategoryIdNot` duplicate name check on Category update (Task 1). (5) Specified single-query + in-memory tree assembly for comment threading (Task 7) to prevent N+1 queries. (6) Added top-level comment pagination to `GET /api/v1/posts/{id}/comments` (Task 7). (7) Replaced ambiguous re-parenting prose with explicit depth algorithm and concrete A→B→C→D example (Task 6). (8) Added explicit `ownershipVerifier.verify()` calls for post update/delete (Task 5) and comment delete (Task 7) with IDOR prevention tests. (9) Added premium access exemptions for post author and ADMIN role (Task 4). (10) Added Cross-Cutting Conventions section: manual SLF4J logging, `@Transactional(readOnly=true)`, extend `BaseIntegrationTest`, `@Transactional` on IT classes, `DataIntegrityViolationException` catch pattern. (11) Added explicit Tag unit tests (Task 2). (12) Documented PUT = full-replacement semantics for Category and Post updates. Phase 2B task numbers shifted (now Tasks 10-22). |
 | 3.0 | 2026-03-15 | Revised per critical review v2 (`2026-03-01-phase2a-content-crud-implementation-critical-review-2.md`). Changes: (1) Changed comment deletion from hard delete to soft delete with "[deleted]" placeholder — preserves thread structure and other users' replies. Added Flyway migration `V4__add_comment_is_deleted.sql`. Corrected false claim that schema has `ON DELETE CASCADE` on `parent_comment_id` (it uses default RESTRICT). (2) Added `DataIntegrityViolationException` catch on `CategoryService.delete()` to handle FK violation when category has referencing posts — returns 400 with clear message. (3) Added Hibernate `deletedFilter` activation pattern to cross-cutting conventions with `enableDeletedFilter()` helper method using injected `EntityManager`. Specified which `PostService` methods enable the filter and which don't (admin restore). (4) Added `findByIdWithParentChain` JOIN FETCH query to `CommentRepository` — loads full parent chain (max depth 3) in one query, preventing N+1 lazy loads during depth calculation. (5) Made `getPost()` authentication-aware: accepts nullable `Authentication`, guards `markAsRead()` and premium checks against null/anonymous users. Added tests for anonymous access. Added convention for all auth-aware public endpoints. (6) Added Markdown content contract to cross-cutting conventions — content is raw Markdown, frontends must use safe renderer, no server-side HTML sanitization. (7) Added `updated_by` column to `post_update_log` via Flyway migration `V3__add_audit_updated_by.sql` for audit trail actor attribution. (8) Added `CategoryResponse.from()` static factory method and DTO mapping convention — all response DTOs provide `from()` factory. Updated controller to use `CategoryResponse::from`. (9) Added explicit JPQL for `PostRepository.findAllWithCounts()` using correlated COUNT subqueries (not JOIN+GROUP BY) to avoid fan-out problem. Documented separate tag batch-loading strategy. (10) Added `countQuery` and `Pageable` to full-text search native query for proper pagination support. (11) Added idempotent `LikeRepository.likePost()` native upsert (`INSERT ... ON CONFLICT DO NOTHING`), matching ReadPost pattern. (12) Added missing integration tests for category update: `updateCategory_asAdmin_returns200`, `_duplicateName_returns400`, `_asUser_returns403`. (13) Annotated `findByTagNameIn` as reserved for future use. (14) Added note deferring per-endpoint rate limiting to future phase. |
 | 4.0 | 2026-03-15 | Revised per security audit (`2026-03-15-phase2a-content-crud-implementation-security-audit-1.md`). Changes: (1) **[High] Server-side Markdown sanitization:** Replaced client-side-only XSS defense with server-side render + sanitize pipeline. Added commonmark-java + OWASP Java HTML Sanitizer. Created `MarkdownSanitizer` component. Content responses now include both `contentRaw` and `contentHtml` fields. Updated content contract convention. (2) **[Medium] Full-text search input constraints:** Added `@Size(max = 200)` validation on search query parameter in PostController. Added code comment documenting `plainto_tsquery` is intentional for safety. (3) **[Medium] Comments endpoint deleted-post check:** `GET /api/v1/posts/{id}/comments` now verifies post is not soft-deleted before returning comments — prevents information disclosure for deleted posts. Added integration test. (4) **[Medium] Per-endpoint rate limiting:** Moved from deferred to Phase 2A. Added comment creation (10 req/min) and like/unlike (30 req/min) per-user limits as additional tiers in existing `RateLimitFilter`. (5) **[Low] Audit log forensic fields:** Added `ip_address VARCHAR(45)` and `user_agent VARCHAR(500)` to `post_update_log` migration (`V3`). Populated from `HttpServletRequest` via `RequestContextHolder`. Subject to 90-day retention policy (cleanup job in Phase 2B). |
 | 5.0 | 2026-03-15 | Cross-plan consistency review. Fixed task total from 22 to 21 (Task 10 removed in 2B v2.0). Updated Phase 2B cross-reference to "Tasks 11–22" with note about Task 10 removal. |
+| 6.0 | 2026-04-30 | Cross-phase consistency review. Changes: (1) Fixed entity ID accessor mismatches — getCategoryId()/getTagId() → getId() throughout, existsByCategoryNameAndCategoryIdNot → existsByCategoryNameAndIdNot. (2) Removed premature c.deleted filter from Task 3 JPQL (comment is_deleted not added until Task 7); added note to update query in Task 7. (3) Fixed ReadPost/SavedPost/Like repository methods — replaced Spring Data derived query names with explicit @Query annotations for composite-key and relationship-based lookups. (4) Replaced @Slf4j (Lombok) with manual SLF4J logger declarations — project does not use Lombok. (5) Added commonmark-java and OWASP HTML Sanitizer as required build.gradle dependencies. (6) Added PostListProjection intermediate record for JPQL constructor; PostListResponse now assembled in service layer with tags. (7) Added PostUpdateLog entity modification step alongside V3 migration (updatedBy, ipAddress, userAgent fields). |
